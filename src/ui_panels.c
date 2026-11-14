@@ -334,6 +334,12 @@ static void gpu_details(int y, int x, int w, const gpu_t *g)
         kv(y, &xx, xm, pct_attr(g->dec_pct), "decode", "%.0f%%", g->dec_pct);
     if (g->pcie_gen > 0 && g->pcie_width > 0)
         kv(y, &xx, xm, A_BOLD, "PCIe", "%d.0 x%d", g->pcie_gen, g->pcie_width);
+    char held[64];
+    for (int i = 0; i < g->nscr && gpu_screen_holds(g, held, sizeof held)[0]; i++)
+        if (g->scr[i].on) { /* it can't power off while it draws a screen */
+            kv(y, &xx, xm, CP(C_INFO), "awake for", "the screen on %s", g->scr[i].conn);
+            break;
+        }
 }
 
 static void panel_gpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
@@ -411,7 +417,7 @@ static void panel_gpu(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
 
 static int mem_need(sys_t *s, ui_state_t *u, int w)
 {
-    return 6;
+    return 6 + (s->mem.nzram > 0); /* zram: how full, how well it compresses */
 }
 
 static void panel_mem(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
@@ -441,6 +447,33 @@ static void panel_mem(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             put(iy + r, ix, 5, CP(C_INFO), "Swap");
             put(iy + r, ix + 5, iw - 5, A_GRAY, "none");
         }
+        r++;
+    }
+    if (m->nzram && r < ih) { /* compressed RAM: all zram devices together */
+        unsigned long long used = 0, size = 0, orig = 0, compr = 0, ram = 0;
+        const char *algo = "";
+        for (int i = 0; i < m->nswap; i++)
+            if (m->swap[i].zram) {
+                used += m->swap[i].used;
+                size += m->swap[i].size;
+                orig += m->swap[i].orig;
+                compr += m->swap[i].compr;
+                ram += m->swap[i].ram;
+                if (!algo[0])
+                    algo = m->swap[i].algo;
+            }
+        int kx = ix, km = ix + iw;
+        fmt_bytes((double)used, a, sizeof a);
+        fmt_bytes((double)size, b, sizeof b);
+        kv(iy + r, &kx, km, A_BOLD, "zram", "%s/%s", a, b);
+        if (compr > 0 && orig > 0)
+            kv(iy + r, &kx, km, A_BOLD, "", "%.1fx smaller", (double)orig / (double)compr);
+        if (ram > 0) {
+            fmt_bytes((double)ram, a, sizeof a);
+            kv(iy + r, &kx, km, A_BOLD, "takes", "%s", a);
+        }
+        if (algo[0])
+            kv(iy + r, &kx, km, A_GRAY, "", "%s", algo);
         r++;
     }
     if (r < ih) {
@@ -475,6 +508,7 @@ typedef struct {
     char label[64], val[32];
     attr_t va;
     int sub;
+    int drop; /* short of room, the highest goes first: 3 cores and iGPU, 2 the AC adapter, 1 a sleeping GPU */
 } pline_t;
 
 static int pl_add(pline_t *L, int n, int max, attr_t va, int sub, const char *label, const char *fmt, ...)
@@ -490,6 +524,7 @@ static int pl_add(pline_t *L, int n, int max, attr_t va, int sub, const char *la
     va_end(ap);
     L[n].va = va;
     L[n].sub = sub;
+    L[n].drop = sub ? 3 : 0;
     return n + 1;
 }
 
@@ -516,9 +551,10 @@ static int build_power(sys_t *s, pline_t *L, int max)
             continue; /* Intel iGPU already shown as uncore */
         char lab[48];
         sfmt(lab, sizeof lab, "GPU%d %s", i, g->vendor);
-        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE)
+        if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE) {
             n = pl_add(L, n, max, A_GRAY, 0, lab, "%s", g->nv_state == NV_ASLEEP ? "asleep" : "idle");
-        else if (g->power_cap_w > 0)
+            L[n - 1].drop = 1;
+        } else if (g->power_cap_w > 0)
             n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 0, lab, "%.1f/%.0f W", g->power_w, g->power_cap_w);
         else
             n = pl_add(L, n, max, CP(C_WARN) | A_BOLD, 0, lab, "%.1f W", g->power_w);
@@ -544,8 +580,10 @@ static int build_power(sys_t *s, pline_t *L, int max)
         else
             n = pl_add(L, n, max, va, 0, lab, "%s", "");
     }
-    if (p->ac_online >= 0 && p->nbat)
+    if (p->ac_online >= 0 && p->nbat) {
         n = pl_add(L, n, max, A_BOLD, 0, "AC adapter", "%s", p->ac_online ? "online" : "offline");
+        L[n - 1].drop = 2;
+    }
     if (!n)
         n = pl_add(L, n, max, A_GRAY, 0, "No power sensors found", "%s", "");
     return n;
@@ -570,6 +608,16 @@ static void panel_power(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     int ix = x + 2, iw = w - 4, iy = y + 1, ih = h - 2, r = 0;
     if (ih <= 0)
         return;
+    while (n > ih) { /* short of room: cores, iGPU, the AC adapter and a sleeping GPU go before the battery */
+        int d = -1;
+        for (int i = n - 1; i >= 0; i--)
+            if (L[i].drop > 0 && (d < 0 || L[i].drop > L[d].drop))
+                d = i;
+        if (d < 0)
+            break;
+        memmove(&L[d], &L[d + 1], sizeof L[0] * (size_t)(n - d - 1));
+        n--;
+    }
     for (int i = 0; i < n && r < ih; i++, r++) {
         int vw = utf8_cols(L[i].val);
         if (L[i].sub)
@@ -725,6 +773,17 @@ static void panel_net(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             double d = f->signal_dbm;
             xx += put(iy + r, xx, xm - xx, d >= -67 ? CP(C_OK) : d >= -75 ? CP(C_WARN) : CP(C_CRIT), "  %.0f dBm", d);
         }
+        if (f->wifi.ok && xm - xx >= 9) { /* the band, channel and link speed, as far as they fit */
+            const wifi_t *wf = &f->wifi;
+            char wb[48];
+            if (wf->tx_mbps > 0 && xm - xx >= 24)
+                sfmt(wb, sizeof wb, "  %s ch %d  %.0fM", wifi_band(wf->freq), wf->channel, wf->tx_mbps);
+            else if (wf->tx_mbps > 0 && xm - xx >= 15)
+                sfmt(wb, sizeof wb, "  %s %.0fM", wifi_band(wf->freq), wf->tx_mbps);
+            else
+                sfmt(wb, sizeof wb, "  %s", wifi_band(wf->freq));
+            xx += put(iy + r, xx, xm - xx, wf->tx_mbps > 0 && wf->tx_mbps < 30 ? CP(C_WARN) : A_NORMAL, "%s", wb);
+        }
         if (f->addr[0] && xm - xx >= (int)strlen(f->addr) + 2)
             put(iy + r, xx, xm - xx, A_GRAY, "  %s", f->addr);
         else if (f->speed > 0 && xm - xx >= 10)
@@ -789,7 +848,7 @@ static int temps_list(sys_t *s, tent_t *T, int max)
     }
     for (int i = 0; i < S->n && n < max; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx || t->hidden)
+        if (t->type != SENS_TEMP || !t->ok || i == S->cpu_idx || t->hidden || !sensor_plausible(t))
             continue;
         sensor_short_name(S, i, T[n].name, sizeof T[n].name); /* "ACPI 2", "NVMe", "Core 3" */
         T[n].v = t->value;
@@ -838,6 +897,24 @@ static void panel_temps(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
     }
     int cols = temps_cols(iw), rows = MIN((n + cols - 1) / cols, MIN(ih, 8)), cw = iw / cols;
     int shown = MIN(n, rows * cols);
+    if (shown < n && rows <= 2) { /* short of room: side by side, the CPU first, as many as fit */
+        int r = 0, kx = ix, km = ix + iw, i = 0;
+        for (; i < n; i++) {
+            char v[16];
+            sfmt(v, sizeof v, "%.0f%s", T[i].v, DEG);
+            int need = utf8_cols(T[i].name) + 1 + utf8_cols(v);
+            if (kx > ix && kx + need > km) {
+                if (r + 1 >= rows)
+                    break;
+                r++;
+                kx = ix;
+            }
+            kv(iy + r, &kx, km, temp_attr_lim(T[i].v, T[i].mine ? T[i].crit : 0) | A_BOLD, T[i].name, "%s", v);
+        }
+        if (i < n)
+            kv(iy + r, &kx, km, A_GRAY, "", "+%d more", n - i);
+        return;
+    }
     for (int i = 0; i < shown; i++) {
         int cy = iy + i % rows, cx = ix + (i / rows) * cw, aw = cw - (cols > 1 ? 3 : 0);
         int nw = MIN(14, aw / 2), vw = 5, bw = aw - nw - vw - 1;
@@ -924,12 +1001,34 @@ static void panel_fans(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
         return;
     if (!n) {
         put(iy, ix, iw, A_GRAY, "No fan speed sensors found.");
-        if (ih > 1)
+        if (ih > 1 && machine_desktop(&s->mach)) /* a board's fan chip may want its driver loaded */
             put(iy + 1, ix, iw, A_GRAY, "Desktop boards often need a driver: try 'sudo sensors-detect'");
         return;
     }
+    if (n > ih) { /* more fans than rows: side by side, as many as fit */
+        int r = 0, kx = ix, km = ix + iw, i = 0;
+        for (; i < n; i++) {
+            char v[24];
+            if (F[i].pct)
+                sfmt(v, sizeof v, "%.0f%%", F[i].v);
+            else
+                sfmt(v, sizeof v, "%.0f RPM", F[i].v);
+            int need = utf8_cols(F[i].name) + 1 + utf8_cols(v);
+            if (kx > ix && kx + need > km) {
+                if (r + 1 >= ih)
+                    break;
+                r++;
+                kx = ix;
+            }
+            int slow = F[i].min > 0 && F[i].v < F[i].min;
+            kv(iy + r, &kx, km, slow ? CP(C_CRIT) | A_BOLD : F[i].v <= 0 ? A_GRAY : A_BOLD, F[i].name, "%s", v);
+        }
+        if (i < n) /* the title has the count; a note when there's room */
+            kv(iy + r, &kx, km, A_GRAY, "", "+%d more", n - i);
+        return;
+    }
     int nw = MIN(18, iw / 3);
-    for (int i = 0; i < n && i < ih; i++) {
+    for (int i = 0; i < n; i++) {
         char v[24];
         if (F[i].pct)
             sfmt(v, sizeof v, "%.0f%%", F[i].v);
@@ -1128,6 +1227,9 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             if (v->crit || v->media_err) {
                 dl = 2;
                 sfmt(bad, sizeof bad, "%s %s", v->name, v->crit ? "WARNING" : "media errors");
+            } else if (v->heat_open && dl < 1) { /* slowing itself down from heat now */
+                dl = 1;
+                sfmt(bad, sizeof bad, "%s slowed by heat", v->name);
             } else {
                 ok++;
                 wear = MAX(wear, v->used);
@@ -1158,6 +1260,14 @@ static void panel_health(sys_t *s, ui_state_t *u, int y, int x, int h, int w)
             kv(iy + r, &kx, km, CP(C_OK), "Drives", "%d OK%s", ok, root ? ", more with root" : "");
         else
             kv(iy + r, &kx, km, A_GRAY, "Drives", "%s", root ? "needs root" : "n/a");
+    }
+    for (int i = 0; i < s->usb.n && s->usb.nslow; i++) { /* a USB 3 drive held to USB 2 speed: slow copies */
+        const usbdev_t *d = &s->usb.d[i];
+        if (d->slow && (!strcmp(d->kind, "storage") || !strcmp(d->kind, "network") || !strcmp(d->kind, "Wi-Fi"))) {
+            kv(iy + r, &kx, km, CP(C_WARN) | A_BOLD, "USB", "%s at USB 2 speed%s", d->blk[0] ? d->blk : d->name,
+               s->usb.nslow > 1 ? " (and more)" : "");
+            break;
+        }
     }
     if (H->kmsg == 1) {
         if (H->kmsg_err)
@@ -1296,14 +1406,16 @@ static void layout_column(sys_t *s, ui_state_t *u, const int *ids, int n, int y,
                     h[i]++;
         sum = top_h;
     }
-    while (sum > top_h) {
-        int done = 0;
-        for (int i = n - 1; i >= 0 && !done; i--)
-            if (h[i] > 3) {
-                h[i]--;
-                sum--;
-                done = 1;
-            }
+    while (sum > top_h) { /* too tall: the tallest panel gives a row first (the upper one of two), so a short list stays whole */
+        int done = 0, t = -1;
+        for (int i = 0; i < n; i++)
+            if (h[i] > 3 && (t < 0 || h[i] > h[t]))
+                t = i;
+        if (t >= 0) {
+            h[t]--;
+            sum--;
+            done = 1;
+        }
         if (!done)
             for (int i = n - 1; i >= 0; i--)
                 if (h[i] > 0) {

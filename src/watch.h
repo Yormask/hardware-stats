@@ -30,7 +30,7 @@
 /* mode: "screen", "log" or "watch"; tui: the screen is up (messages go there) */
 void watch_start(sys_t *s, ui_state_t *u, const char *mode, int tui);
 void watch_tick(sys_t *s, ui_state_t *u); /* after every sample */
-void watch_end(void);                     /* a normal exit */
+void watch_end(sys_t *s);                 /* a normal exit */
 void watch_keep_changed(void);            /* "delete logs after" changed: clean up soon */
 
 /* what the start-up check found out about the previous session */

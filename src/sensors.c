@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 typedef struct {
     int type, num, pref;
@@ -155,10 +156,16 @@ static int cpu_score(const sensor_t *s)
         return !strncmp(l, "Package", 7) ? 100 : 50;
     if (!strncmp(c, "k10temp", 7) || !strncmp(c, "zenpower", 8))
         return !strcmp(l, "Tctl") ? 100 : !strcmp(l, "Tdie") ? 95 : 60;
+    if (!strncmp(c, "x86_pkg_temp", 12)) /* the package, as a thermal zone */
+        return 90;
+    if (!strncmp(c, "k8temp", 6) || strstr(c, "cputemp")) /* old AMD, VIA / Zhaoxin */
+        return 50;
     if (!strncmp(c, "cpu", 3) || strstr(c, "cpu_thermal") || strstr(c, "soc_thermal"))
         return 40;
     if (!strncmp(c, "thinkpad", 8) && !strcmp(l, "CPU"))
         return 30;
+    if (!strncasecmp(l, "CPU", 3) || !strncmp(l, "PECI", 4)) /* a board's or laptop's own CPU reading */
+        return 20;
     if (!strncmp(c, "acpitz", 6))
         return 10;
     return 0;
@@ -342,6 +349,12 @@ void sensors_apply(sensors_t *S, const srule_t *r, int n)
         if (!t->ulo && !t->uhi) /* no limits (any more): nothing to report */
             t->lim_t = 0, t->lim_flagged = 0;
     }
+}
+
+/* a temperature no chip reaches: an input with nothing on it (127 or -128, -62 °C on boards' spare inputs) */
+int sensor_plausible(const sensor_t *t)
+{
+    return t->type != SENS_TEMP || (t->value > -40 && t->value < 127);
 }
 
 const char *sensor_label(const sensor_t *t)

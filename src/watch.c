@@ -100,12 +100,12 @@ void watch_keep_changed(void)
     W.next_keep = now_sec() + KEEP_DELAY;
 }
 
-void watch_end(void)
+void watch_end(sys_t *s)
 {
     if (!W.started)
         return;
     rec_end(1);
-    history_end();
+    history_end(s);
     session_end();
     netq_set(0, NULL);
     W.started = 0;

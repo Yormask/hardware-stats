@@ -70,7 +70,7 @@ int prog_get_day(int day, prog_day_t *out); /* for the History view; 0 = somethi
 
 void history_start(sys_t *s); /* from watch_start */
 void history_tick(sys_t *s);  /* every sample */
-void history_end(void);
+void history_end(sys_t *s);   /* the last events too */
 int history_writer(void);           /* this hsm writes the files (holds the lock) */
 int history_today(hday_t *out);     /* today so far, when this hsm is the writer; 0 = ok */
 int history_parse_event(char *line, hevent_t *e); /* a line of events.log; 0 = ok (line is changed) */

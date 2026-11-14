@@ -161,7 +161,7 @@ typedef struct {
 
 enum { ALERT_OFF, ALERT_DESKTOP, ALERT_BELL, ALERT_BOTH, ALERT_COUNT };
 
-int ui_init(int utf8); /* -1 when the terminal type is unknown */
+int ui_init(int utf8); /* -1 when the terminal type is unknown, -2 when it can't move the cursor ("dumb") */
 void ui_mouse(int on); /* clicks and the wheel on or off */
 void ui_end(void);
 void ui_draw(sys_t *s, ui_state_t *u);

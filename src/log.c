@@ -50,9 +50,9 @@ enum {
     CH_GPU_LOAD, CH_GPU_TEMP, CH_GPU_POWER, CH_GPU_CLOCK, CH_GPU_VRAM,
     CH_POWER_TOTAL, CH_RAPL, CH_BAT_POWER, CH_BAT_CHARGE, CH_SENSOR,
     CH_DISK_R, CH_DISK_W, CH_DISK_BUSY, CH_NET_RX, CH_NET_TX,
-    CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN,
+    CH_THROTTLE, CH_PSI, CH_OOM, CH_PCIE, CH_NVME_USED, CH_NVME_MEDIA, CH_NVME_UNSAFE, CH_NVME_WARN, CH_NVME_HEAT,
     CH_SATA_WEAR, CH_SATA_REALLOC, CH_SATA_PENDING, CH_SATA_CRC,
-    CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
+    CH_DISK_RLAT, CH_DISK_WLAT, CH_NET_ERR, CH_NET_SIGNAL, CH_NET_LINK, CH_NET_FREQ, CH_WAKEUPS, CH_CSTATE, CH_FREEZE,
     CH_GPU_SLOW_HEAT, CH_GPU_SLOW_POWER, CH_CPU_PL, CH_GPU_ENC, CH_GPU_DEC, CH_GPU_PCIE_GEN, CH_GPU_PCIE_W,
     CH_PING, CH_PING_LOSS,
     CH_EVENTS /* stays last */
@@ -172,6 +172,8 @@ void log_build_channels(sys_t *s, const char *skip)
         add("Health", CH_NVME_UNSAFE, i, "", "count", lab, "nvme.%s.unsafe", n);
         sfmt(lab, sizeof lab, "%s critical warning", n);
         add("Health", CH_NVME_WARN, i, "", "count", lab, "nvme.%s.warning", n);
+        sfmt(lab, sizeof lab, "%s slowed by heat (total)", n);
+        add("Health", CH_NVME_HEAT, i, "", "s", lab, "nvme.%s.heat_slowed", n);
     }
     for (int i = 0; i < H->nsata; i++) {
         const sata_t *d = &H->sata[i];
@@ -303,6 +305,10 @@ void log_build_channels(sys_t *s, const char *skip)
         if (f->wireless) {
             sfmt(lab, sizeof lab, "%s Wi-Fi signal", f->name);
             add("Network", CH_NET_SIGNAL, 0, f->name, "dBm", lab, "net.%s.signal", f->name);
+            sfmt(lab, sizeof lab, "%s Wi-Fi link speed", f->name);
+            add("Network", CH_NET_LINK, 0, f->name, "Mb/s", lab, "net.%s.link", f->name);
+            sfmt(lab, sizeof lab, "%s Wi-Fi frequency", f->name);
+            add("Network", CH_NET_FREQ, 0, f->name, "MHz", lab, "net.%s.freq", f->name);
         }
     }
     if (s->net.q.on) { /* the network check, when it runs as the log starts */
@@ -390,6 +396,8 @@ double log_chan_value(const sys_t *s, const chan_t *c)
     case CH_NET_TX:
     case CH_NET_ERR:
     case CH_NET_SIGNAL:
+    case CH_NET_LINK:
+    case CH_NET_FREQ:
         for (i = 0; i < s->net.n; i++)
             if (!strcmp(s->net.i[i].name, c->name)) {
                 const netif_t *f = &s->net.i[i];
@@ -397,6 +405,8 @@ double log_chan_value(const sys_t *s, const chan_t *c)
                 case CH_NET_RX: return f->rx_bps / MB;
                 case CH_NET_TX: return f->tx_bps / MB;
                 case CH_NET_ERR: return f->err_rate + f->drop_rate;
+                case CH_NET_LINK: return f->wifi.ok && f->wifi.tx_mbps > 0 ? f->wifi.tx_mbps : NAN;
+                case CH_NET_FREQ: return f->wifi.ok ? f->wifi.freq : NAN;
                 default: return f->quality >= 0 ? f->signal_dbm : NAN;
                 }
             }
@@ -418,12 +428,16 @@ double log_chan_value(const sys_t *s, const chan_t *c)
     case CH_NVME_USED:
     case CH_NVME_MEDIA:
     case CH_NVME_UNSAFE:
-    case CH_NVME_WARN: {
+    case CH_NVME_WARN:
+    case CH_NVME_HEAT: {
         if (c->a >= s->health.nnvme || s->health.nvme[c->a].state != 1)
             return NAN;
         const nvme_t *v = &s->health.nvme[c->a];
-        return c->kind == CH_NVME_USED ? v->used : c->kind == CH_NVME_MEDIA ? (double)v->media_err
-             : c->kind == CH_NVME_UNSAFE ? (double)v->unsafe : (double)v->crit;
+        return c->kind == CH_NVME_USED     ? v->used
+             : c->kind == CH_NVME_MEDIA    ? (double)v->media_err
+             : c->kind == CH_NVME_UNSAFE   ? (double)v->unsafe
+             : c->kind == CH_NVME_HEAT     ? (double)(v->heat_s[0] + v->heat_s[1])
+                                           : (double)v->crit;
     }
     case CH_SATA_WEAR:
     case CH_SATA_REALLOC:

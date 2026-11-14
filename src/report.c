@@ -81,6 +81,9 @@ static void report_health(sys_t *s)
             fmt_bytes(v->read_b, b, sizeof b);
             printf("%s, %d%% worn, spare %d%%, %llu unsafe shutdowns, %llu media errors, %llu h, %s written, %s read\n",
                    v->crit ? "WARNING" : "OK", v->used, v->spare, v->unsafe, v->media_err, v->hours, a, b);
+            if (v->heat_n[0] || v->heat_n[1] || v->heat_s[0] || v->heat_s[1])
+                printf("  %-11s heat slowdowns since new: %llu light (%llu s), %llu hard (%llu s)\n", "", v->heat_n[0],
+                       v->heat_s[0], v->heat_n[1], v->heat_s[1]);
         } else {
             printf("%s\n", v->state == -1 ? "health needs root (sudo)" : "health not available");
         }
@@ -199,6 +202,17 @@ void report_print(sys_t *s, int nproc)
     fmt_bytes((double)m->swap_used, a, sizeof a);
     fmt_bytes((double)m->swap_total, b, sizeof b);
     printf("  swap      %s / %s\n", a, b);
+    for (int i = 0; i < m->nswap; i++) {
+        const swapdev_t *d = &m->swap[i];
+        fmt_bytes((double)d->used, a, sizeof a);
+        fmt_bytes((double)d->size, b, sizeof b);
+        printf("    %-14s %-9s %s / %s", d->name, d->zram ? "zram" : d->file ? "file" : "partition", a, b);
+        if (d->zram && d->compr && d->orig) {
+            fmt_bytes((double)d->ram, c, sizeof c);
+            printf(", %.1fx smaller (%s), takes %s of RAM", (double)d->orig / (double)d->compr, d->algo, c);
+        }
+        printf("\n");
+    }
 
     report_health(s);
 
@@ -296,6 +310,20 @@ void report_print(sys_t *s, int nproc)
         if (f->errors || f->drops)
             printf("  %llu errors, %llu dropped since boot", f->errors, f->drops);
         printf("\n");
+    }
+
+    if (s->usb.ok && s->usb.n) {
+        printf("\nUSB\n");
+        for (int i = 0; i < s->usb.n; i++) {
+            const usbdev_t *d = &s->usb.d[i];
+            char sp[24];
+            usb_speed(d->mbps, sp, sizeof sp);
+            printf("  %-8s %-30.30s %-14s %-11s %s%s%s\n", d->id, d->name, d->kind, sp,
+                   d->where == 1 ? "socket" : d->where == 2 ? "built in" : d->where == 3 ? "via hub" : "",
+                   d->blk[0] ? "  " : "", d->blk);
+            if (d->slow)
+                printf("  %-8s runs at USB 2 speed, can do %dG\n", "", d->can / 1000);
+        }
     }
 
     if (s->sens.n) {

@@ -164,6 +164,24 @@ void metrics_write(FILE *f, sys_t *s)
     help("swap_bytes", "gauge", "swap");
     one("swap_bytes", "kind", "total", (double)s->mem.swap_total);
     one("swap_bytes", "kind", "used", (double)s->mem.swap_used);
+    if (s->mem.nswap) {
+        help("swap_device_bytes", "gauge", "each swap device: its size and what's used");
+        for (int i = 0; i < s->mem.nswap; i++) {
+            two("swap_device_bytes", "device", s->mem.swap[i].name, "kind", "size", (double)s->mem.swap[i].size);
+            two("swap_device_bytes", "device", s->mem.swap[i].name, "kind", "used", (double)s->mem.swap[i].used);
+        }
+    }
+    if (s->mem.nzram) {
+        help("zram_bytes", "gauge", "compressed RAM: what's stored, compressed to, and the RAM it takes");
+        for (int i = 0; i < s->mem.nswap; i++) {
+            const swapdev_t *d = &s->mem.swap[i];
+            if (!d->zram)
+                continue;
+            two("zram_bytes", "device", d->name, "kind", "stored", (double)d->orig);
+            two("zram_bytes", "device", d->name, "kind", "compressed", (double)d->compr);
+            two("zram_bytes", "device", d->name, "kind", "ram", (double)d->ram);
+        }
+    }
     if (s->mem.oom_ok) {
         help("oom_kills_total", "counter", "processes killed for lack of memory since boot");
         plain("oom_kills_total", (double)s->mem.oom_kill);
@@ -316,6 +334,27 @@ void metrics_write(FILE *f, sys_t *s)
         for (int i = 0; i < s->net.n; i++)
             if (s->net.i[i].link_downs >= 0)
                 one("network_link_drops_total", "interface", s->net.i[i].name, (double)s->net.i[i].link_downs);
+        int wl = 0; /* Wi-Fi, one metric at a time */
+        for (int i = 0; i < s->net.n; i++)
+            wl |= s->net.i[i].wireless && s->net.i[i].wifi.ok;
+        if (wl) {
+            help("wifi_signal_dbm", "gauge", "the Wi-Fi signal");
+            for (int i = 0; i < s->net.n; i++)
+                if (s->net.i[i].wifi.ok && s->net.i[i].quality >= 0)
+                    one("wifi_signal_dbm", "interface", s->net.i[i].name, s->net.i[i].signal_dbm);
+            help("wifi_link_mbps", "gauge", "the Wi-Fi link speed, each way");
+            for (int i = 0; i < s->net.n; i++) {
+                const netif_t *nf = &s->net.i[i];
+                if (nf->wifi.ok && nf->wifi.tx_mbps > 0)
+                    two("wifi_link_mbps", "interface", nf->name, "direction", "tx", nf->wifi.tx_mbps);
+                if (nf->wifi.ok && nf->wifi.rx_mbps > 0)
+                    two("wifi_link_mbps", "interface", nf->name, "direction", "rx", nf->wifi.rx_mbps);
+            }
+            help("wifi_frequency_mhz", "gauge", "the Wi-Fi channel's frequency (2.4, 5 or 6 GHz band)");
+            for (int i = 0; i < s->net.n; i++)
+                if (s->net.i[i].wifi.ok)
+                    one("wifi_frequency_mhz", "interface", s->net.i[i].name, s->net.i[i].wifi.freq);
+        }
     }
     if (s->net.q.on && !s->net.q.err) { /* the network check */
         static const char *const nm[NQ_COUNT] = { "router", "internet" };
@@ -362,6 +401,12 @@ void metrics_write(FILE *f, sys_t *s)
         one("pcie_errors_total", "severity", "nonfatal", (double)h->pci_nonfatal);
         one("pcie_errors_total", "severity", "fatal", (double)h->pci_fatal);
     }
+    if (s->usb.ok) {
+        help("usb_devices", "gauge", "USB devices plugged in (hubs included)");
+        plain("usb_devices", s->usb.n);
+        help("usb_slow_devices", "gauge", "USB 3 drives and network adapters running at USB 2 speed");
+        plain("usb_slow_devices", s->usb.nslow);
+    }
     help("freezes_total", "counter", "times the whole system stood still for 2 s or more, since hsm started");
     plain("freezes_total", h->freezes);
     help("runaway_processes", "gauge", "processes that have kept a whole core busy for 15 minutes or more without a break");
@@ -405,6 +450,26 @@ void metrics_write(FILE *f, sys_t *s)
         if (!any++)
             help("drive_media_errors_total", "counter", "errors the drive could not correct, in its life");
         one("drive_media_errors_total", "drive", d->name, (double)d->uncorrect);
+    }
+    any = 0;
+    for (int i = 0; i < h->nnvme; i++) { /* the drive's own thermal management */
+        const nvme_t *v = &h->nvme[i];
+        if (v->state != 1)
+            continue;
+        if (!any++)
+            help("drive_heat_slowdowns_total", "counter", "times the drive slowed itself down from heat, in its life");
+        two("drive_heat_slowdowns_total", "drive", v->name, "kind", "light", (double)v->heat_n[0]);
+        two("drive_heat_slowdowns_total", "drive", v->name, "kind", "hard", (double)v->heat_n[1]);
+    }
+    any = 0;
+    for (int i = 0; i < h->nnvme; i++) {
+        const nvme_t *v = &h->nvme[i];
+        if (v->state != 1)
+            continue;
+        if (!any++)
+            help("drive_heat_slowed_seconds_total", "counter", "seconds the drive ran slowed down from heat, in its life");
+        two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "light", (double)v->heat_s[0]);
+        two("drive_heat_slowed_seconds_total", "drive", v->name, "kind", "hard", (double)v->heat_s[1]);
     }
     any = 0;
     for (int i = 0; i < h->nsata; i++) {

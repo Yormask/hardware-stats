@@ -27,7 +27,7 @@
 
 #define APP_NAME "hsm"
 #define APP_LONG_NAME "hardware status monitor"
-#define APP_VERSION "1.9.0"
+#define APP_VERSION "1.10.0"
 #define APP_COPYRIGHT "Copyright (C) 2026 Yormask"
 #define PATHBUF 512
 

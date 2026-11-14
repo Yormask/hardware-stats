@@ -223,6 +223,29 @@ static void memory(sys_t *s)
     num("used_pct", m->total ? 100.0 * (double)m->used / (double)m->total : NAN, 1);
     integer("swap_total_bytes", (long long)m->swap_total);
     integer("swap_used_bytes", (long long)m->swap_used);
+    open_("swaps", '[');
+    for (int i = 0; i < m->nswap; i++) {
+        const swapdev_t *d = &m->swap[i];
+        open_(NULL, '{');
+        s_("name", d->name);
+        s_("type", d->zram ? "zram" : d->file ? "file" : "partition");
+        integer("size_bytes", (long long)d->size);
+        integer("used_bytes", (long long)d->used);
+        integer("priority", d->prio);
+        if (d->zram) {
+            integer("stored_bytes", (long long)d->orig);
+            integer("compressed_bytes", (long long)d->compr);
+            integer("ram_bytes", (long long)d->ram);
+            num("ratio", d->compr ? (double)d->orig / (double)d->compr : NAN, 2);
+            sn("algorithm", d->algo);
+        }
+        close_('}');
+    }
+    close_(']');
+    if (m->zswap >= 0)
+        boolean("zswap", m->zswap);
+    else
+        null_("zswap");
     if (m->oom_ok)
         integer("oom_kills_since_boot", (long long)m->oom_kill);
     else
@@ -261,6 +284,24 @@ static void gpus(sys_t *s)
             boolean("slowed_by_power_limit", (g->slow_now & GS_POWER) != 0);
             pos("held_back_pct_of_busy_time", g->busy_s > 0 ? 100.0 * g->held_s / g->busy_s : -1, 1);
         }
+        open_("screens", '[');
+        for (int k = 0; k < g->nscr; k++) {
+            const screen_t *sc = &g->scr[k];
+            open_(NULL, '{');
+            s_("port", sc->conn);
+            sn("monitor", sc->monitor);
+            boolean("built_in", sc->builtin);
+            boolean("in_use", sc->on);
+            if (sc->w > 0) {
+                integer("width", sc->w);
+                integer("height", sc->h);
+            }
+            pos("inches", sc->inch > 0 ? sc->inch : -1, 1);
+            close_('}');
+        }
+        close_(']');
+        char held[64];
+        sn("kept_awake_by", gpu_screen_holds(g, held, sizeof held));
         close_('}');
     }
     close_(']');
@@ -365,6 +406,28 @@ static void network(sys_t *s)
             num("signal_dbm", f->signal_dbm, 0);
             integer("link_quality_pct", f->quality);
         }
+        if (f->wireless && f->wifi.ok) {
+            const wifi_t *w = &f->wifi;
+            open_("wifi", '{');
+            s_("band", wifi_band(w->freq));
+            integer("frequency_mhz", w->freq);
+            integer("channel", w->channel);
+            if (w->width)
+                integer("width_mhz", w->width);
+            else
+                null_("width_mhz");
+            if (w->gen)
+                integer("generation", w->gen);
+            else
+                null_("generation");
+            pos("tx_mbps", w->tx_mbps, 1);
+            pos("rx_mbps", w->rx_mbps, 1);
+            pos("resent_pct", w->retry_pct, 1);
+            integer("connected_s", w->connected_s);
+            close_('}');
+        } else if (f->wireless) {
+            null_("wifi");
+        }
         close_('}');
     }
     close_(']');
@@ -392,6 +455,41 @@ static void network_check(sys_t *s)
         close_('}');
     }
     close_('}');
+}
+
+static void usb(sys_t *s)
+{
+    const usb_t *u = &s->usb;
+    if (!u->ok) {
+        null_("usb");
+        return;
+    }
+    open_("usb", '[');
+    for (int i = 0; i < u->n; i++) {
+        const usbdev_t *d = &u->d[i];
+        char id[12];
+        open_(NULL, '{');
+        s_("port", d->id);
+        s_("name", d->name);
+        sfmt(id, sizeof id, "%04x:%04x", d->vid, d->pid);
+        s_("id", id);
+        s_("kind", d->kind);
+        sn("disk", d->blk);
+        num("speed_mbps", d->mbps, d->mbps < 12 ? 1 : 0);
+        if (d->can > 0)
+            integer("can_do_mbps", d->can);
+        else
+            null_("can_do_mbps");
+        boolean("slow", d->slow);
+        if (d->port3 >= 0)
+            boolean("usb3_port", d->port3);
+        else
+            null_("usb3_port");
+        s_("where", d->where == 1 ? "socket" : d->where == 2 ? "built in" : d->where == 3 ? "behind a hub" : "unknown");
+        integer("power_ma", d->ma);
+        close_('}');
+    }
+    close_(']');
 }
 
 static void sensors(sys_t *s)
@@ -493,6 +591,13 @@ static void health(sys_t *s)
             integer("power_on_hours", (long long)v->hours);
             integer("unsafe_shutdowns", (long long)v->unsafe);
             integer("media_errors", (long long)v->media_err);
+            open_("heat_slowdowns", '{'); /* counted by the drive since new */
+            integer("light", (long long)v->heat_n[0]);
+            integer("light_s", (long long)v->heat_s[0]);
+            integer("hard", (long long)v->heat_n[1]);
+            integer("hard_s", (long long)v->heat_s[1]);
+            boolean("now", v->heat_open);
+            close_('}');
         }
         close_('}');
     }
@@ -669,6 +774,7 @@ void json_write(FILE *f, sys_t *s, int nproc)
     storage(s);
     network(s);
     network_check(s);
+    usb(s);
     sensors(s);
     health(s);
     services(s);

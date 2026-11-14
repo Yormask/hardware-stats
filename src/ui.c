@@ -580,6 +580,8 @@ static int mouse_event(sys_t *s, ui_state_t *u)
     switch (h->kind) {
     case HIT_KEY: return ui_key(s, u, h->a);
     case HIT_VIEW:
+        if (u->view == VIEW_HW && h->a != VIEW_HW && cool_guard(s, u, -1 - h->a))
+            break; /* a cooling check runs: the first click only asks */
         if (h->a == VIEW_LOG && u->view == VIEW_LOG) /* the tab of the view you're in: back to its start */
             u->log_mode = 0;
         u->view = h->a;

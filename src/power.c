@@ -111,6 +111,8 @@ void power_init(power_t *p)
                 b->lim_end = b->lim_start = -1;
             } else if (!strcmp(type, "Mains") && !p->ac_path[0]) {
                 sfmt(p->ac_path, sizeof p->ac_path, "%s/online", dir);
+            } else if (!strcmp(type, "USB") && strcmp(scope, "Device") && p->nusbc < 4) {
+                sfmt(p->usbc_path[p->nusbc++], sizeof p->usbc_path[0], "%s/online", dir);
             }
         }
         closedir(d);
@@ -179,10 +181,7 @@ static void battery_sample(battery_t *b)
         int he = 0;
         static const char *const ends[] = { "charge_control_end_threshold", "charge_stop_threshold" };
         for (int k = 0; k < 2 && !he; k++)
-            if (battr(b, ends[k], &e) == 0) {
-                he = 1;
-                str_copy(b->lim_file, sizeof b->lim_file, ends[k]);
-            }
+            he = battr(b, ends[k], &e) == 0;
         int hs = battr(b, "charge_control_start_threshold", &s) == 0 || battr(b, "charge_start_threshold", &s) == 0;
         b->lim_ok = he;
         b->lim_end = he && e > 0 && e < 100 ? (int)e : -1;
@@ -351,5 +350,11 @@ void power_sample(power_t *p, double dt)
         double ta = now_sec();
         p->ac_online = read_ll(p->ac_path, &v) == 0 ? (int)v : -1;
         note_slow(p, ta, "the AC adapter");
+    } else if (p->nusbc) { /* USB-C only: plugged in when one of them charges */
+        long long v;
+        p->ac_online = -1;
+        for (int i = 0; i < p->nusbc; i++)
+            if (read_ll(p->usbc_path[i], &v) == 0)
+                p->ac_online = MAX(p->ac_online, v > 0 ? 1 : 0);
     }
 }

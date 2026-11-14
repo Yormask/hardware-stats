@@ -25,10 +25,69 @@
 #include <math.h>
 #include <string.h>
 
+/* the key (or tab, as -1 - view) that would leave a running check, pressed once */
+static int g_leave;
+
+static int leaves(int ch)
+{
+    return (ch >= '1' && ch <= '8' && ch != '3') || ch == 's' || ch == '\t' || ch == KEY_BTAB || ch == 'q' ||
+           ch == 'Q' || ch == KEY_F(2) || ch == KEY_F(10) || ch == 'T' || ch == KEY_F(5) || ch == '/';
+}
+
+static const char *what_key(int k, char *buf, size_t n)
+{
+    if (k < 0)
+        return "Click the tab";
+    const char *name = k == '\t'      ? "Tab"
+                     : k == KEY_BTAB  ? "Shift+Tab"
+                     : k == KEY_F(2)  ? "F2"
+                     : k == KEY_F(5)  ? "F5"
+                     : k == KEY_F(10) ? "F10"
+                                      : NULL;
+    if (name)
+        sfmt(buf, n, "Press %s", name);
+    else
+        sfmt(buf, n, "Press %c", k);
+    return buf;
+}
+
+/* 1: wait, the check is running (the first press only warns); 0: go ahead,
+ * after stopping it if it ran. k: a key, or -1 - view for a click on a tab */
+int cool_guard(sys_t *s, ui_state_t *u, int k)
+{
+    const cool_t *c = cooling_state();
+    int busy = c->phase == COOL_BASE || c->phase == COOL_LOAD || c->phase == COOL_REST;
+    if (!busy || !u->cool_open) {
+        g_leave = 0;
+        return 0;
+    }
+    if (g_leave == k) { /* again: stop it and go */
+        g_leave = 0;
+        cooling_stop();
+        cooling_stopped_event(&s->health);
+        ui_message(u, 0, "Cooling check stopped; the CPU load is off");
+        return 0;
+    }
+    g_leave = k;
+    char b[32];
+    ui_message(u, 1, "The cooling check is running. %s again to stop the check and leave, any other key keeps it going.",
+               what_key(k, b, sizeof b));
+    return 1;
+}
+
 int cool_key(sys_t *s, ui_state_t *u, int ch)
 {
     const cool_t *c = cooling_state();
     int busy = c->phase == COOL_BASE || c->phase == COOL_LOAD || c->phase == COOL_REST;
+    if (!busy)
+        g_leave = 0;
+    if (busy && leaves(ch))
+        return cool_guard(s, u, ch);
+    if (busy && g_leave) { /* any other key: it goes on */
+        g_leave = 0;
+        ui_message(u, 0, "The cooling check goes on");
+        return 1;
+    }
     switch (ch) {
     case '\n':
     case '\r':

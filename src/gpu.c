@@ -34,6 +34,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <linux/perf_event.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -386,6 +387,34 @@ static int cmp_int(const void *a, const void *b)
     return *(const int *)a - *(const int *)b;
 }
 
+/* GPUs of SoCs (ARM boards, phones' chips in laptops): no PCI, known by their driver ("vc4-drm", "msm_drm") */
+static const struct {
+    const char *driver, *vendor, *name;
+} SOC_GPU[] = { { "vc4", "BCM", "Broadcom VideoCore (vc4)" },   { "v3d", "BCM", "Broadcom V3D" },
+                { "panfrost", "ARM", "Arm Mali (panfrost)" },   { "panthor", "ARM", "Arm Mali (panthor)" },
+                { "lima", "ARM", "Arm Mali (lima)" },           { "msm", "QCOM", "Qualcomm Adreno (msm)" },
+                { "asahi", "Apple", "Apple GPU (asahi)" },      { "etnaviv", "Vivante", "Vivante GPU (etnaviv)" },
+                { "tegra", "NVIDIA", "NVIDIA Tegra" },          { "rockchip", "RK", "Rockchip display" },
+                { "meson", "Amlogic", "Amlogic display" },      { "sun4i", "AW", "Allwinner display" },
+                { "mediatek", "MTK", "MediaTek display" },      { "imx", "NXP", "i.MX display" },
+                { "exynos", "Samsung", "Exynos display" } };
+
+/* the vendor of a graphics device that isn't Intel, AMD or NVIDIA (virtual machines, servers) */
+static const char *other_vendor(unsigned ven)
+{
+    static const struct {
+        unsigned id;
+        const char *name;
+    } V[] = { { 0x1af4, "Virtio" }, { 0x15ad, "VMware" },  { 0x1234, "QEMU" },  { 0x1b36, "QXL" },
+              { 0x80ee, "VBox" },   { 0x1013, "Cirrus" },  { 0x102b, "Matrox" }, { 0x1a03, "ASPEED" },
+              { 0x1414, "Hyper-V" }, { 0x1d17, "Zhaoxin" }, { 0x1ed5, "Moore" },  { 0x5333, "S3" },
+              { 0x1106, "VIA" },    { 0x18ca, "XGI" },     { 0x1de1, "Tekram" } };
+    for (size_t i = 0; i < sizeof V / sizeof V[0]; i++)
+        if (V[i].id == ven)
+            return V[i].name;
+    return "GPU";
+}
+
 static void add_sysfs_gpus(gpus_t *gs, int nvml_ok)
 {
     char base[PATHBUF], p[PATHBUF];
@@ -412,8 +441,22 @@ static void add_sysfs_gpus(gpus_t *gs, int nvml_ok)
         sfmt(g->dev, sizeof g->dev, "%s/device", g->drm);
         unsigned ven, dev;
         sfmt(p, sizeof p, "%s/vendor", g->dev);
-        if (read_hex(p, &ven))
-            continue; /* simpledrm / non-PCI framebuffer */
+        if (read_hex(p, &ven)) { /* not PCI: an SoC's GPU, or simpledrm (the firmware's framebuffer) */
+            sfmt(p, sizeof p, "%s/driver", g->dev);
+            link_base(p, g->driver, sizeof g->driver);
+            for (size_t k = 0; k < sizeof SOC_GPU / sizeof SOC_GPU[0]; k++)
+                if (!strncmp(g->driver, SOC_GPU[k].driver, strlen(SOC_GPU[k].driver))) {
+                    str_copy(g->vendor, sizeof g->vendor, SOC_GPU[k].vendor);
+                    str_copy(g->name, sizeof g->name, SOC_GPU[k].name);
+                    str_copy(g->note, sizeof g->note, "this driver gives no load figures");
+                    g->integrated = 1;
+                    g->clk_max_mhz = -1;
+                    find_hwmon(g);
+                    gs->n++;
+                    break;
+                }
+            continue;
+        }
         sfmt(p, sizeof p, "%s/device", g->dev);
         if (read_hex(p, &dev))
             dev = 0;
@@ -421,16 +464,20 @@ static void add_sysfs_gpus(gpus_t *gs, int nvml_ok)
         sfmt(p, sizeof p, "%s/driver", g->dev);
         link_base(p, g->driver, sizeof g->driver);
 
-        const char *vname = ven == 0x8086 ? "Intel" : ven == 0x1002 ? "AMD" : ven == 0x10de ? "NVIDIA" : "GPU";
+        const char *vname = ven == 0x8086 ? "Intel" : ven == 0x1002 ? "AMD" : ven == 0x10de ? "NVIDIA" : other_vendor(ven);
         str_copy(g->vendor, sizeof g->vendor, vname);
         if (ven == 0x10de && nvml_ok && !strcmp(g->driver, "nvidia"))
             continue; /* reported through NVML instead */
 
         char pn[80];
-        if (pci_lookup_name(ven, dev, pn, sizeof pn) == 0)
+        if (pci_lookup_name(ven, dev, pn, sizeof pn) == 0 && !strncasecmp(pn, vname, strlen(vname)))
+            str_copy(g->name, sizeof g->name, pn); /* "Virtio 1.0 GPU", "ASPEED Graphics Family" */
+        else if (pci_lookup_name(ven, dev, pn, sizeof pn) == 0)
             sfmt(g->name, sizeof g->name, "%s %s", vname, pn);
-        else
+        else if (strcmp(vname, "GPU"))
             sfmt(g->name, sizeof g->name, "%s GPU [%04x:%04x]", vname, ven, dev);
+        else
+            sfmt(g->name, sizeof g->name, "GPU [%04x:%04x]", ven, dev);
 
         g->clk_max_mhz = -1;
         if (ven == 0x8086) {
@@ -775,13 +822,18 @@ static void nv_policy(gpus_t *gs, double now)
     }
     if (!any || !all_auto) /* can't power off: NVML stays, as it always did */
         return;
+    int screen = 0; /* a screen on it: it can't power off, so letting go of it gains nothing */
+    for (int i = 0; i < gs->n; i++) {
+        char held[64];
+        screen |= gpu_screen_holds(&gs->g[i], held, sizeof held)[0] != 0;
+    }
     if (nv_live) {
-        if (all_idle && now >= gs->nv_keep_until)
+        if (all_idle && now >= gs->nv_keep_until && !screen)
             nvml_down(gs);
         return;
     }
     /* let go of: asleep now, or woken up by something, or still on? */
-    int wake = 0, stays_on = 0;
+    int wake = 0, stays_on = 0, held = 0;
     for (int i = 0; i < gs->n; i++) {
         gpu_t *g = &gs->g[i];
         if (g->nv_state == NV_NONE)
@@ -794,11 +846,13 @@ static void nv_policy(gpus_t *gs, double now)
             g->nv_state = NV_ASLEEP;
         } else if (g->nv_state == NV_ASLEEP) {
             wake = 1; /* a game, a video, another program: worth watching */
+        } else if (screen) {
+            held = 1; /* a screen keeps it on: no use waiting, and no failure either */
         } else if (now - g->nv_wait_t >= NV_WAIT_SLEEP) {
             stays_on = 1; /* something else keeps it on: hsm isn't the reason */
         }
     }
-    if ((wake || stays_on) && now >= gs->nv_retry_t) {
+    if ((wake || stays_on || held) && now >= gs->nv_retry_t) {
         if (nvml_up(gs) != 0) {
             gs->nv_retry_t = now + 30;
             return;
@@ -813,6 +867,128 @@ static void nv_policy(gpus_t *gs, double now)
         /* stays on anyway: try letting go again after 5, 10, 20, 40 min */
         gs->nv_keep_until = stays_on ? now + 300.0 * (1 << MIN(MAX(fails - 1, 0), 3)) : now;
     }
+}
+
+/* ------------------------------------------------------------- screens */
+
+/* the base block of an EDID: the monitor's name and size */
+static void edid_parse(const unsigned char *e, size_t n, screen_t *s)
+{
+    static const unsigned char head[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
+    if (n < 128 || memcmp(e, head, 8))
+        return;
+    if (e[21] && e[22]) /* cm */
+        s->inch = sqrt((double)e[21] * e[21] + (double)e[22] * e[22]) / 2.54;
+    for (int d = 54; d <= 108; d += 18) {
+        const unsigned char *b = e + d;
+        if (b[0] || b[1] || b[3] != 0xfc) /* a timing, or not the name */
+            continue;
+        char nm[16];
+        int k = 0;
+        for (int i = 5; i < 18 && b[i] != '\n' && b[i]; i++)
+            nm[k++] = b[i] >= 32 && b[i] < 127 ? (char)b[i] : ' ';
+        nm[k] = '\0';
+        while (k > 0 && nm[k - 1] == ' ')
+            nm[--k] = '\0';
+        str_copy(s->monitor, sizeof s->monitor, nm);
+    }
+}
+
+/* the DRM card of a GPU known by its PCI address (NVIDIA comes through NVML): "card0", or "" */
+static void drm_card_of(const gpu_t *g, const char *base, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (!strncmp(g->card, "card", 4)) {
+        str_copy(out, n, g->card);
+        return;
+    }
+    if (!g->pci[0])
+        return;
+    DIR *d = opendir(base);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "card", 4) || strchr(e->d_name, '-'))
+            continue;
+        char p[PATHBUF], l[PATHBUF];
+        sfmt(p, sizeof p, "%s/%s/device", base, e->d_name);
+        ssize_t k = readlink(p, l, sizeof l - 1);
+        if (k <= 0)
+            continue;
+        l[k] = '\0';
+        const char *b = strrchr(l, '/');
+        if (!strcmp(b ? b + 1 : l, g->pci)) {
+            str_copy(out, n, e->d_name);
+            break;
+        }
+    }
+    closedir(d);
+}
+
+/* the screens on a GPU's ports: /sys/class/drm/card1-HDMI-A-1/ (status, enabled, modes, edid) */
+static void screens_read(gpu_t *g)
+{
+    g->nscr = 0;
+    char base[PATHBUF], card[24];
+    sfmt(base, sizeof base, "%s/class/drm", g_sysfs);
+    drm_card_of(g, base, card, sizeof card);
+    if (!card[0])
+        return;
+    DIR *d = opendir(base);
+    if (!d)
+        return;
+    size_t cl = strlen(card);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && g->nscr < MAX_SCREENS) {
+        if (strncmp(e->d_name, card, cl) || e->d_name[cl] != '-' || strlen(e->d_name + cl + 1) >= sizeof g->scr[0].conn)
+            continue;
+        char p[PATHBUF], b[64];
+        sfmt(p, sizeof p, "%s/%s/status", base, e->d_name);
+        if (read_line(p, b, sizeof b) || strcmp(b, "connected"))
+            continue;
+        screen_t *s = &g->scr[g->nscr++];
+        memset(s, 0, sizeof *s);
+        str_copy(s->conn, sizeof s->conn, e->d_name + cl + 1);
+        s->builtin = !strncmp(s->conn, "eDP", 3) || !strncmp(s->conn, "LVDS", 4) || !strncmp(s->conn, "DSI", 3);
+        sfmt(p, sizeof p, "%s/%s/enabled", base, e->d_name);
+        s->on = read_line(p, b, sizeof b) || strcmp(b, "disabled"); /* unknown: say it's in use */
+        sfmt(p, sizeof p, "%s/%s/modes", base, e->d_name);
+        if (read_line(p, b, sizeof b) == 0 && sscanf(b, "%dx%d", &s->w, &s->h) != 2)
+            s->w = s->h = 0;
+        unsigned char ed[512];
+        sfmt(p, sizeof p, "%s/%s/edid", base, e->d_name);
+        ssize_t n = read_file(p, (char *)ed, sizeof ed);
+        if (n >= 128)
+            edid_parse(ed, (size_t)n, s);
+    }
+    closedir(d);
+    for (int i = 1; i < g->nscr; i++) /* the built-in screen first, then by name */
+        for (int k = i; k > 0; k--) {
+            screen_t *a = &g->scr[k - 1], *c = &g->scr[k];
+            if (a->builtin > c->builtin || (a->builtin == c->builtin && strcmp(a->conn, c->conn) <= 0))
+                break;
+            screen_t t = *a;
+            *a = *c;
+            *c = t;
+        }
+}
+
+/* a screen on a GPU that could sleep without it: "HDMI-A-1 (DELL U2720Q)", or "" */
+const char *gpu_screen_holds(const gpu_t *g, char *out, size_t n)
+{
+    out[0] = '\0';
+    if (g->nv_state == NV_NONE || g->nv_state == NV_ASLEEP || g->integrated || !g->pm_auto) /* one that could power off, and is on */
+        return out;
+    for (int i = 0; i < g->nscr; i++)
+        if (g->scr[i].on) {
+            if (g->scr[i].monitor[0])
+                sfmt(out, n, "%s (%s)", g->scr[i].conn, g->scr[i].monitor);
+            else
+                str_copy(out, n, g->scr[i].conn);
+            break;
+        }
+    return out;
 }
 
 void gpus_sample(gpus_t *gs, double dt)
@@ -842,6 +1018,10 @@ void gpus_sample(gpus_t *gs, double dt)
             g->slow_since = 0;
         } else {
             sysfs_sample(g);
+        }
+        if (!g->scr_t || now - g->scr_t >= 5.0) { /* screens come and go now and then */
+            g->scr_t = now;
+            screens_read(g);
         }
         double took = now_sec() - t0;
         if (took > gs->slow_s) {

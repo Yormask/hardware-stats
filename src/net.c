@@ -59,6 +59,8 @@ static void if_link(netif_t *f)
     }
 }
 
+static void wext_signal(net_t *nt, char *buf);
+
 void net_sample(net_t *nt, double dt)
 {
     static char *buf;
@@ -102,6 +104,7 @@ void net_sample(net_t *nt, double dt)
             sfmt(path, sizeof path, "%s/class/net/%s/wireless", g_sysfs, name);
             f->wireless = path_exists(path);
             f->quality = -1;
+            f->wifi.retry_pct = -1;
             f->link_downs = f->downs_seen = -1;
         }
         f->seen = 1;
@@ -145,19 +148,33 @@ void net_sample(net_t *nt, double dt)
     nt->rx_bps = phys ? rx : vrx;
     nt->tx_bps = phys ? tx : vtx;
 
-    /* Wi-Fi signal: /proc/net/wireless (link quality out of 70, level in dBm) */
+    /* Wi-Fi: band, channel and link speed from nl80211; the signal from
+     * /proc/net/wireless (link quality out of 70, level in dBm), or nl80211 */
     int wl = 0;
+    double mono = now_sec();
     for (int i = 0; i < nt->n; i++)
         if (nt->i[i].wireless) {
             nt->i[i].quality = -1;
             nt->i[i].signal_dbm = 0;
+            wifi_sample(&nt->i[i], mono);
             wl = 1;
         }
     sfmt(path, sizeof path, "%s/net/wireless", g_procfs);
-    if (!wl || read_file_grow(path, &buf, &cap) <= 0)
-        return;
-    cur = buf;
-    lineno = 0;
+    if (wl && read_file_grow(path, &buf, &cap) > 0)
+        wext_signal(nt, buf);
+    for (int i = 0; i < nt->n; i++) { /* no wireless extensions in this kernel: nl80211's signal */
+        netif_t *f = &nt->i[i];
+        if (f->wireless && f->quality < 0 && f->wifi.ok && f->wifi.signal < 0) {
+            f->signal_dbm = f->wifi.signal;
+            f->quality = (int)CLAMP(2.0 * (f->wifi.signal + 100), 0, 100);
+        }
+    }
+}
+
+static void wext_signal(net_t *nt, char *buf)
+{
+    char *cur = buf, *line;
+    int lineno = 0;
     while ((line = next_line(&cur)) != NULL) {
         if (lineno++ < 2)
             continue;

@@ -86,6 +86,18 @@ void cpu_sample(cpu_t *c, double dt);
 void cpu_power_sample(cpu_t *c); /* governor, turbo...: slow-changing, every few seconds */
 
 /* --------------------------------------------------------------- Memory */
+#define MAX_SWAPS 8
+
+/* a swap device from /proc/swaps; zram is compressed RAM */
+typedef struct {
+    char name[48];                  /* "zram0", "nvme0n1p3", "/swapfile" */
+    int zram, file;                 /* compressed RAM; a swap file (else a partition) */
+    unsigned long long size, used;  /* bytes */
+    int prio;
+    unsigned long long orig, compr, ram; /* zram: what's stored, compressed to, and the RAM it takes, bytes */
+    char algo[16];                  /* zram: the compressor */
+} swapdev_t;
+
 typedef struct {
     unsigned long long total, free, avail, buffers, cached, sreclaim, shmem;
     unsigned long long swap_total, swap_free, dirty, writeback;
@@ -96,6 +108,11 @@ typedef struct {
 
     unsigned long long p_swpin, p_swpout, p_majflt;
     int primed;
+    int nswap, nzram;
+    swapdev_t swap[MAX_SWAPS];
+    int zswap;                      /* zswap (a compressed cache in front of swap): 1 on, 0 off, -1 not built in */
+    char zswap_algo[16];
+    unsigned long long zswap_stored, zswap_pool; /* bytes, root only (debugfs); 0 = unknown */
 } mem_t;
 
 void mem_sample(mem_t *m, double dt);
@@ -136,6 +153,23 @@ void fs_sample(disks_t *ds);
 /* -------------------------------------------------------------- Network */
 #define MAX_NETIF 64
 
+/* Wi-Fi details from nl80211 */
+typedef struct {
+    int ok;                    /* connected: these are known */
+    int sta;
+    int freq, center, width;   /* MHz: the channel's frequency, its centre, its width */
+    int channel, gen;          /* gen: Wi-Fi 4 (n), 5 (ac), 6 (ax), 7 (be); 0 older or unknown */
+    int signal;                /* dBm, 0 = unknown */
+    double tx_mbps, rx_mbps;   /* link speed each way, -1 = unknown */
+    unsigned long long tx_pkts, tx_retries, tx_failed;
+    unsigned connected_s, beacon_loss;
+    double retry_pct;          /* frames sent again, of all sent, lately; -1 = unknown */
+    double win_t;              /* ... counted from here (monotonic) */
+    unsigned long long win_pkts, win_retries;
+    int band_told;             /* the frequency the last band event was about */
+    double band_since;         /* on another band since (monotonic), 0 = no */
+} wifi_t;
+
 typedef struct {
     char name[32], state[16], addr[48];
     int up, is_virtual, wireless, speed; /* speed in Mb/s, -1 = unknown */
@@ -149,6 +183,7 @@ typedef struct {
     long long downs_seen;             /* health: the count already reported */
     double down_t;                    /* health: when the link went down (wall), 0 = it's up */
     int primed, seen;
+    wifi_t wifi; /* wireless interfaces */
 } netif_t;
 
 /* network quality: the router and one internet address pinged every 2 s
@@ -184,6 +219,10 @@ typedef struct {
 } net_t;
 
 void net_sample(net_t *n, double dt);
+void wifi_sample(netif_t *f, double mono);                         /* in net_sample, for a wireless interface */
+int wifi_band_moved(netif_t *f, double mono, char *out, size_t n); /* 1: a band event to tell */
+int wifi_channel(int mhz);
+const char *wifi_band(int mhz); /* "2.4 GHz", "5 GHz", "6 GHz", "" */
 void net_addrs(net_t *n);
 
 /* ------------------------------------------------------------ Processes */
@@ -275,7 +314,8 @@ typedef struct {
     int hide;
 } srule_t;
 void sensors_apply(sensors_t *S, const srule_t *r, int n);
-const char *sensor_label(const sensor_t *t); /* your name, or the chip's label */
+const char *sensor_label(const sensor_t *t);
+int sensor_plausible(const sensor_t *t); /* 0: a temperature nothing reaches (an input with nothing on it) */ /* your name, or the chip's label */
 int sensor_bad(const sensor_t *t);           /* past your limits (voltages: or the chip's) */
 
 void sensors_init(sensors_t *s);
@@ -296,9 +336,26 @@ typedef struct {
     double pct;
 } gpu_engine_t;
 
+#define MAX_SCREENS 8
+
+/* a screen on one of a GPU's ports (DRM connectors; reading them doesn't wake the GPU) */
+typedef struct {
+    char conn[24];    /* "eDP-1", "HDMI-A-1", "DP-2" */
+    char monitor[24]; /* the name in its EDID, "DELL U2720Q"; "" unknown */
+    int w, h;         /* its preferred mode */
+    double inch;      /* diagonal, from the EDID's size; 0 = unknown */
+    int builtin;      /* the laptop's own panel (eDP, LVDS, DSI) */
+    int on;           /* in use (connected, and something draws on it) */
+} screen_t;
+
 typedef struct {
     char name[96], vendor[8], driver[16], card[16], pci[24], note[80];
     int integrated;
+    int nscr;                   /* screens connected to its ports */
+    screen_t scr[MAX_SCREENS];
+    double scr_t;               /* read at (monotonic): every 5 s */
+    char scr_told[128];         /* health: the screens already told about ("HDMI-A-1,DP-1,") */
+    int scr_primed;
     double util;                /* busiest engine %, -1 = unknown */
     double mem_used, mem_total; /* bytes, -1 = unknown            */
     double temp_c, power_w, power_cap_w, clk_mhz, clk_max_mhz, mem_clk_mhz, fan_pct, fan_rpm;
@@ -351,6 +408,7 @@ typedef struct {
 
 void gpus_init(gpus_t *g);
 void gpus_sample(gpus_t *g, double dt);
+const char *gpu_screen_holds(const gpu_t *g, char *out, size_t n); /* a screen keeping a dGPU awake: "HDMI-A-1 (DELL U2720Q)" */
 void gpus_close(gpus_t *g);
 void gpus_proc_sample(gpus_t *g, procs_t *ps); /* NVIDIA: per-process GPU use through NVML */
 int pci_lookup_name(unsigned vendor, unsigned device, char *out, size_t n); /* from pci.ids */
@@ -374,8 +432,7 @@ typedef struct {
     double energy_wh, energy_full_wh;  /* the charge in it now / when full, Wh, -1 = unknown */
     long cycles;                       /* charge cycles, -1 = unknown */
     /* a charge limit (laptops that can stop charging early to slow wear) */
-    int lim_ok;              /* the battery has the setting ... */
-    char lim_file[40];       /* ... in this file */
+    int lim_ok;              /* the battery has the setting */
     int lim_end, lim_start;  /* stops at / starts again below, %; -1 = not set */
     double lim_t;            /* when it was last read (monotonic) */
 } battery_t;
@@ -400,6 +457,8 @@ typedef struct {
     int nbat;
     battery_t bat[4];
     char ac_path[PATHBUF];
+    char usbc_path[4][PATHBUF]; /* no "Mains" supply: the USB-C ports that charge (type USB) */
+    int nusbc;
     int ac_online; /* -1 = unknown */
     double pkg_w, core_w, uncore_w, dram_w, psys_w; /* -1 = unknown */
     /* the "psys" (whole platform) domain is left unconnected by some laptop
@@ -461,6 +520,12 @@ typedef struct {
     int spare, spare_thr, used; /* % */
     unsigned long long hours, cycles, unsafe, media_err, err_log, warn_min, crit_min;
     double read_b, written_b;
+    /* slowing itself down from heat, counted by the drive since new: [0] a little
+     * (thermal management temperature 1), [1] hard (temperature 2) */
+    unsigned long long heat_n[2], heat_s[2]; /* times, seconds */
+    int heat_open, heat_hard;                /* slowing down now (or lately); it got to the hard kind */
+    double heat_from, heat_t, heat_max_c;    /* wall clock: first and last time seen; hottest meanwhile */
+    unsigned long long heat_n0[2], heat_s0[2]; /* the counters when it began */
 } nvme_t;
 
 #define MAX_SATA 8
@@ -675,7 +740,45 @@ typedef struct {
     char board[96];
     char bios_vendor[64], bios_version[64];
     int bios_date;                        /* YYYYMMDD, 0 = unknown */
+    int chassis;                          /* SMBIOS chassis type: 3 desktop, 10 notebook, 35 mini PC...; 0 = unknown */
 } machine_t;
+int machine_desktop(const machine_t *m); /* a desktop's chassis (or a tower, mini PC, all-in-one) */
+
+/* ------------------------------------------------------------------ USB */
+#define MAX_USB 40
+
+/* a USB device: what it is, the speed it runs at and where it's plugged in */
+typedef struct {
+    char id[20];       /* where: "1-2" (bus 1, port 2), "3-1.4" (port 4 of a hub in port 1) */
+    char name[64];     /* "SanDisk Ultra", "Logitech USB Receiver", or "0781:5581" */
+    char kind[16];     /* "storage", "keyboard", "mouse", "camera", "audio", "hub", "Bluetooth"... */
+    char blk[16];      /* the disk it gives, "sdb" (storage) */
+    unsigned vid, pid;
+    int devnum;        /* a new one each time it connects */
+    double mbps;       /* the speed it runs at: 1.5, 12, 480, 5000, 10000, 20000 */
+    int can;           /* the most it can do, Mb/s (its BOS descriptor), 0: unknown */
+    int port3;         /* the port it's in can do USB 3: 1 yes, 0 USB 2 only, -1 unknown */
+    int where;         /* 1 an outside socket, 2 built in, 3 behind a hub, 0 unknown */
+    int depth;         /* hubs on the way */
+    int slow;          /* it can do USB 3 but runs at USB 2 speed */
+    int ma;            /* the power it asks for, mA */
+    double seen;       /* wall clock: when it came (0: there when hsm started) */
+    int told;          /* its "connected" event is out (or it needs none) */
+} usbdev_t;
+
+typedef struct {
+    int ok; /* the USB tree can be read */
+    int n;
+    usbdev_t d[MAX_USB];
+    unsigned long long sig; /* the names and device numbers, to notice a change cheaply */
+    int primed, nslow;
+    double next_blk;
+    int ngone;
+    struct {
+        usbdev_t d;
+        double t;
+    } gone[8]; /* just disconnected: told after 3 s, unless it comes back meanwhile */
+} usb_t;
 
 typedef struct {
     char host[64], kernel[64], os[96], arch[24];
@@ -693,6 +796,7 @@ typedef struct {
     power_t power;
     health_t health;
     svcs_t svc;
+    usb_t usb;
 
     double total_w; /* best whole-machine power estimate, -1 = unknown (never a partial sum) */
     const char *total_w_src;
@@ -718,6 +822,8 @@ void sys_init(sys_t *s);
 void sys_sample(sys_t *s);
 void sys_free(sys_t *s);
 void health_sample(sys_t *s); /* after the other collectors: needs CPU, memory and sensors */
+void usb_sample(sys_t *s);    /* after health_sample: its events, quiet after a resume */
+const char *usb_speed(double mbps, char *out, size_t n); /* "USB 2 480M", "USB 3 10G" */
 void leak_sample(sys_t *s);   /* once a minute, from health_sample */
 void runaway_sample(sys_t *s); /* once a minute, from health_sample */
 void health_close(health_t *h);

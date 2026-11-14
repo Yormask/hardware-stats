@@ -73,6 +73,39 @@ static void add_pair(int pairs[][2], int *n, int a, int b)
     }
 }
 
+/* an ARM core's name from cpuinfo's implementer and part: "Cortex-A72", or NULL */
+static const char *arm_part(unsigned impl, unsigned part, const char **maker)
+{
+    static const struct {
+        unsigned impl, part;
+        const char *name;
+    } P[] = { { 0x41, 0xd03, "Cortex-A53" },    { 0x41, 0xd04, "Cortex-A35" },    { 0x41, 0xd05, "Cortex-A55" },
+              { 0x41, 0xd07, "Cortex-A57" },    { 0x41, 0xd08, "Cortex-A72" },    { 0x41, 0xd09, "Cortex-A73" },
+              { 0x41, 0xd0a, "Cortex-A75" },    { 0x41, 0xd0b, "Cortex-A76" },    { 0x41, 0xd0c, "Neoverse-N1" },
+              { 0x41, 0xd0d, "Cortex-A77" },    { 0x41, 0xd40, "Neoverse-V1" },   { 0x41, 0xd41, "Cortex-A78" },
+              { 0x41, 0xd44, "Cortex-X1" },     { 0x41, 0xd46, "Cortex-A510" },   { 0x41, 0xd47, "Cortex-A710" },
+              { 0x41, 0xd48, "Cortex-X2" },     { 0x41, 0xd49, "Neoverse-N2" },   { 0x41, 0xd4b, "Cortex-A78C" },
+              { 0x41, 0xd4d, "Cortex-A715" },   { 0x41, 0xd4e, "Cortex-X3" },     { 0x41, 0xd4f, "Neoverse-V2" },
+              { 0x41, 0xd80, "Cortex-A520" },   { 0x41, 0xd81, "Cortex-A720" },   { 0x41, 0xd82, "Cortex-X4" },
+              { 0x41, 0xd84, "Neoverse-V3" },   { 0x41, 0xd85, "Cortex-X925" },   { 0x41, 0xd87, "Cortex-A725" },
+              { 0x41, 0xd8e, "Neoverse-N3" },   { 0x51, 0x001, "Oryon" },         { 0xc0, 0xac3, "AmpereOne" },
+              { 0x48, 0xd01, "Kunpeng 920" },   { 0x61, 0x022, "M1 Icestorm" },   { 0x61, 0x023, "M1 Firestorm" },
+              { 0x61, 0x032, "M2 Blizzard" },   { 0x61, 0x033, "M2 Avalanche" } };
+    static const struct {
+        unsigned impl;
+        const char *name;
+    } M[] = { { 0x41, "ARM" }, { 0x51, "Qualcomm" }, { 0x61, "Apple" }, { 0xc0, "Ampere" }, { 0x48, "HiSilicon" },
+              { 0x4e, "NVIDIA" }, { 0x46, "Fujitsu" } };
+    *maker = NULL;
+    for (size_t i = 0; i < sizeof M / sizeof M[0]; i++)
+        if (M[i].impl == impl)
+            *maker = M[i].name;
+    for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
+        if (P[i].impl == impl && P[i].part == part)
+            return P[i].name;
+    return NULL;
+}
+
 void cpu_init(cpu_t *c)
 {
     char path[PATHBUF];
@@ -88,6 +121,8 @@ void cpu_init(cpu_t *c)
     static int pairs[MAX_CPUS][2];
     if (read_file_grow(path, &buf, &cap) > 0) {
         int prio = 0, phys = 0, core = -1;
+        unsigned impl = 0;
+        char arm[96] = ""; /* big.LITTLE: "ARM Cortex-A76 + Cortex-A55" */
         char *cur = buf, *line;
         while ((line = next_line(&cur)) != NULL) {
             char *colon = strchr(line, ':');
@@ -114,11 +149,23 @@ void cpu_init(cpu_t *c)
                 core = atoi(val);
             else if (!strcmp(line, "model name") && prio < 3) {
                 str_copy(c->model, sizeof c->model, val);
-                prio = 3;
+                prio = strncmp(val, "ARMv", 4) ? 3 : 1; /* "ARMv7 Processor rev 3 (v7l)": the part says more */
+            } else if (!strcmp(line, "CPU implementer")) {
+                impl = (unsigned)strtoul(val, NULL, 0);
+            } else if (!strcmp(line, "CPU part") && prio < 3) {
+                const char *maker, *nm = arm_part(impl, (unsigned)strtoul(val, NULL, 0), &maker);
+                if (nm && !strstr(arm, nm)) {
+                    if (!arm[0])
+                        sfmt(arm, sizeof arm, "%s %s", maker ? maker : "", nm);
+                    else if (strlen(arm) + strlen(nm) + 4 < sizeof arm)
+                        sfmt(arm + strlen(arm), sizeof arm - strlen(arm), " + %s", nm);
+                    str_copy(c->model, sizeof c->model, arm[0] == ' ' ? arm + 1 : arm);
+                    prio = 2;
+                }
             } else if ((!strcmp(line, "Model") || !strcmp(line, "Hardware") || !strcmp(line, "cpu model")) &&
-                       prio < 2 && *val) {
+                       prio < 1 && *val) {
                 str_copy(c->model, sizeof c->model, val);
-                prio = 2;
+                prio = 1;
             }
         }
         if (core >= 0)

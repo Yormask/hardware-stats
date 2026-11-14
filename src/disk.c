@@ -61,6 +61,14 @@ static void disk_static(disk_t *d)
     sfmt(p, sizeof p, "%s/block/%s/device/model", g_sysfs, sn);
     if (read_line(p, d->model, sizeof d->model))
         d->model[0] = '\0';
+    if (!d->model[0] && !strncmp(d->name, "mmcblk", 6)) { /* an SD card or eMMC: its name, and which */
+        char nm[32] = "", ty[16] = "";
+        sfmt(p, sizeof p, "%s/block/%s/device/name", g_sysfs, sn);
+        read_line(p, nm, sizeof nm);
+        sfmt(p, sizeof p, "%s/block/%s/device/type", g_sysfs, sn);
+        read_line(p, ty, sizeof ty);
+        sfmt(d->model, sizeof d->model, "%s%s%s", ty[0] ? ty : "", ty[0] && nm[0] ? " " : "", nm);
+    }
     sfmt(p, sizeof p, "%s/block/%s/size", g_sysfs, sn);
     if (!read_ll(p, &v))
         d->size = (unsigned long long)v * 512ULL;

@@ -72,6 +72,15 @@ static void dmi(const char *name, char *out, size_t n)
             out[0] = '\0';
 }
 
+int machine_desktop(const machine_t *m)
+{
+    static const int desk[] = { 3, 4, 5, 6, 7, 13, 15, 16, 24, 35, 36 };
+    for (size_t i = 0; i < sizeof desk / sizeof desk[0]; i++)
+        if (m->chassis == desk[i])
+            return 1;
+    return 0;
+}
+
 static void read_machine(machine_t *m)
 {
     char name[96], ver[64], fam[96], bn[64], bv[64], date[24];
@@ -89,15 +98,37 @@ static void read_machine(machine_t *m)
     }
     dmi("board_vendor", bv, sizeof bv);
     dmi("board_name", bn, sizeof bn);
-    if (bn[0])
+    /* a desktop's name is its board's ("System Product Name"; MSI's "MS-7C91" inside "MAG B550 TOMAHAWK (MS-7C91)") */
+    if (bn[0] && (!m->model[0] || (strlen(m->model) >= 4 && strstr(bn, m->model)))) {
+        str_copy(m->model, sizeof m->model, bn);
+        if (!m->vendor[0])
+            str_copy(m->vendor, sizeof m->vendor, bv);
+    } else if (bn[0]) {
         sfmt(m->board, sizeof m->board, "%s%s%s", bv[0] && strcasecmp(bv, m->vendor) ? bv : "",
              bv[0] && strcasecmp(bv, m->vendor) ? " " : "", bn);
+    }
+    char ct[16];
+    dmi("chassis_type", ct, sizeof ct);
+    m->chassis = atoi(ct);
     dmi("bios_vendor", m->bios_vendor, sizeof m->bios_vendor);
     dmi("bios_version", m->bios_version, sizeof m->bios_version);
     dmi("bios_date", date, sizeof date);
     int mo, d, y;
     if (sscanf(date, "%d/%d/%d", &mo, &d, &y) == 3 && y > 1980 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31)
         m->bios_date = y * 10000 + mo * 100 + d;
+    if (!m->model[0]) { /* ARM boards: no DMI, but a device tree ("Raspberry Pi 4 Model B Rev 1.4") */
+        char p[PATHBUF], b[128];
+        sfmt(p, sizeof p, "%s/firmware/devicetree/base/model", g_sysfs);
+        ssize_t n = read_file(p, b, sizeof b);
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; i++)
+                if ((unsigned char)b[i] < 32)
+                    b[i] = b[i] ? ' ' : '\0';
+            str_copy(m->model, sizeof m->model, b);
+            for (size_t l = strlen(m->model); l && m->model[l - 1] == ' ';)
+                m->model[--l] = '\0';
+        }
+    }
     m->ok = m->model[0] || m->vendor[0] || m->bios_version[0];
 }
 
@@ -291,6 +322,9 @@ void sys_sample(sys_t *s)
     t0 = now_sec();
     health_sample(s);
     timed(worst, sizeof worst, &wd, t0, s->health.slow[0] ? s->health.slow : "the health checks");
+    t0 = now_sec();
+    usb_sample(s);
+    timed(worst, sizeof worst, &wd, t0, "the USB devices");
     t0 = now_sec();
     svcs_sample(&s->svc);
     timed(worst, sizeof worst, &wd, t0, "the services (cgroups)");

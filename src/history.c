@@ -615,10 +615,11 @@ void history_tick(sys_t *s)
     }
 }
 
-void history_end(void)
+void history_end(sys_t *s)
 {
     if (H.fd < 0)
         return;
+    write_events(s); /* e.g. a check stopped by quitting, a moment ago */
     flush_day();
     prog_flush();
     close(H.fd); /* the lock goes with it */

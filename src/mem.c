@@ -22,10 +22,104 @@
 #define _GNU_SOURCE
 #include "collect.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* "lzo lzo-rle lz4 [zstd]" -> "zstd" */
+static void current_algo(const char *path, char *out, size_t n)
+{
+    char b[256];
+    out[0] = '\0';
+    if (read_line(path, b, sizeof b))
+        return;
+    char *l = strchr(b, '['), *r = l ? strchr(l, ']') : NULL;
+    if (l && r) {
+        *r = '\0';
+        str_copy(out, n, l + 1);
+    } else if (!strchr(b, ' ')) {
+        str_copy(out, n, b);
+    }
+}
+
+/* /proc/swaps writes a space in a name as \040 */
+static void unescape(char *s)
+{
+    char *w = s;
+    for (const char *r = s; *r; r++) {
+        if (r[0] == '\\' && r[1] >= '0' && r[1] <= '3' && r[2] >= '0' && r[2] <= '7' && r[3] >= '0' && r[3] <= '7') {
+            *w++ = (char)((r[1] - '0') * 64 + (r[2] - '0') * 8 + (r[3] - '0'));
+            r += 3;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
+static void zram_read(swapdev_t *d)
+{
+    char p[PATHBUF], b[256];
+    sfmt(p, sizeof p, "%s/block/%s/mm_stat", g_sysfs, d->name);
+    unsigned long long o = 0, c = 0, r = 0;
+    if (read_line(p, b, sizeof b) == 0 && sscanf(b, "%llu %llu %llu", &o, &c, &r) == 3) {
+        d->orig = o;
+        d->compr = c;
+        d->ram = r;
+    }
+    sfmt(p, sizeof p, "%s/block/%s/comp_algorithm", g_sysfs, d->name);
+    current_algo(p, d->algo, sizeof d->algo);
+}
+
+/* the swap devices, and zram's compression */
+static void swaps_read(mem_t *m)
+{
+    char path[PATHBUF], buf[8192];
+    m->nswap = m->nzram = 0;
+    sfmt(path, sizeof path, "%s/swaps", g_procfs);
+    if (read_file(path, buf, sizeof buf) > 0) {
+        char *cur = buf, *line;
+        for (int first = 1; (line = next_line(&cur)) != NULL && m->nswap < MAX_SWAPS; first = 0) {
+            char fn[256], type[32];
+            unsigned long long size, used;
+            int prio;
+            if (first || sscanf(line, "%255s %31s %llu %llu %d", fn, type, &size, &used, &prio) != 5)
+                continue;
+            unescape(fn);
+            swapdev_t *d = &m->swap[m->nswap++];
+            memset(d, 0, sizeof *d);
+            str_copy(d->name, sizeof d->name, !strncmp(fn, "/dev/", 5) ? fn + 5 : fn);
+            d->file = !strcmp(type, "file");
+            d->size = size * 1024ULL;
+            d->used = used * 1024ULL;
+            d->prio = prio;
+            d->zram = !strncmp(d->name, "zram", 4) && isdigit((unsigned char)d->name[4]);
+            if (d->zram) {
+                zram_read(d);
+                m->nzram++;
+            }
+        }
+    }
+    char b[16];
+    sfmt(path, sizeof path, "%s/module/zswap/parameters/enabled", g_sysfs);
+    m->zswap = read_line(path, b, sizeof b) ? -1 : (b[0] == 'Y' || b[0] == 'y' || b[0] == '1');
+    m->zswap_stored = m->zswap_pool = 0;
+    m->zswap_algo[0] = '\0';
+    if (m->zswap == 1) {
+        sfmt(path, sizeof path, "%s/module/zswap/parameters/compressor", g_sysfs);
+        current_algo(path, m->zswap_algo, sizeof m->zswap_algo);
+        long long v;
+        long pg = sysconf(_SC_PAGESIZE);
+        sfmt(path, sizeof path, "%s/kernel/debug/zswap/stored_pages", g_sysfs);
+        if (read_ll(path, &v) == 0 && v > 0)
+            m->zswap_stored = (unsigned long long)v * (unsigned long long)(pg > 0 ? pg : 4096);
+        sfmt(path, sizeof path, "%s/kernel/debug/zswap/pool_total_size", g_sysfs);
+        if (read_ll(path, &v) == 0 && v > 0)
+            m->zswap_pool = (unsigned long long)v;
+    }
+}
 
 void mem_sample(mem_t *m, double dt)
 {
@@ -104,4 +198,5 @@ void mem_sample(mem_t *m, double dt)
         m->p_majflt = maj;
         m->primed = 1;
     }
+    swaps_read(m);
 }

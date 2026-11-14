@@ -48,6 +48,7 @@
 #endif
 
 #define NVME_EVERY 60.0 /* seconds between drive health reads */
+#define HEAT_QUIET 300.0 /* s with no new heat slowdown: the drive's run of them is over */
 
 static double wall_now(void)
 {
@@ -551,9 +552,72 @@ static void nvme_find(health_t *h)
             v->model[0] = '\0';
     }
     closedir(d);
+    for (int i = 1; i < h->nnvme; i++) /* nvme0, nvme1, ... nvme10 */
+        for (int k = i; k > 0 && atoi(h->nvme[k - 1].name + 4) > atoi(h->nvme[k].name + 4); k--) {
+            nvme_t t = h->nvme[k - 1];
+            h->nvme[k - 1] = h->nvme[k];
+            h->nvme[k] = t;
+        }
 }
 
-static void nvme_sample(health_t *h)
+/* The drive counts its own heat slowdowns (thermal management): a long copy
+ * or a game install on a hot laptop shows up here. One event when it starts,
+ * one if it gets to the hard kind, one when it's over. */
+static void nvme_heat(health_t *h, const procs_t *ps, nvme_t *v, const unsigned long long n0[2],
+                      const unsigned long long s0[2])
+{
+    double now = wall_now();
+    int up[2];
+    for (int k = 0; k < 2; k++)
+        up[k] = v->heat_n[k] > n0[k] || v->heat_s[k] > s0[k];
+    char tc[24] = "", who[80];
+    if (v->temp_c >= 0)
+        sfmt(tc, sizeof tc, " (%.0f °C)", v->temp_c);
+    if (up[0] || up[1]) {
+        if (!v->heat_open) {
+            v->heat_open = 1;
+            v->heat_hard = up[1];
+            v->heat_from = now;
+            v->heat_max_c = v->temp_c;
+            memcpy(v->heat_n0, n0, sizeof v->heat_n0);
+            memcpy(v->heat_s0, s0, sizeof v->heat_s0);
+            health_blame(ps, BLAME_IO, who, sizeof who);
+            health_event(h, up[1] ? EV_WARN : EV_INFO, "disk", "%s slowed itself down %s to cool off%s%s", v->name,
+                         up[1] ? "hard" : "a little", tc, who);
+        } else if (up[1] && !v->heat_hard) {
+            v->heat_hard = 1;
+            health_blame(ps, BLAME_IO, who, sizeof who);
+            health_event(h, EV_WARN, "disk", "%s now slows itself down hard to cool off%s%s", v->name, tc, who);
+        }
+        v->heat_t = now;
+        v->heat_max_c = MAX(v->heat_max_c, v->temp_c);
+    } else if (v->heat_open && now - v->heat_t >= HEAT_QUIET) {
+        v->heat_open = 0;
+        unsigned long long s[2], n = 0;
+        for (int k = 0; k < 2; k++) {
+            s[k] = v->heat_s[k] > v->heat_s0[k] ? v->heat_s[k] - v->heat_s0[k] : 0;
+            n += v->heat_n[k] > v->heat_n0[k] ? v->heat_n[k] - v->heat_n0[k] : 0;
+        }
+        char how[48], hard[40] = "", in[24], top[24] = "";
+        if (s[0] + s[1]) {
+            char d[24];
+            fmt_duration((double)(s[0] + s[1]), d, sizeof d);
+            str_copy(how, sizeof how, d);
+            if (s[1]) {
+                fmt_duration((double)s[1], d, sizeof d);
+                sfmt(hard, sizeof hard, " (%s of it hard)", d);
+            }
+        } else {
+            sfmt(how, sizeof how, "%llu time%s", n, n == 1 ? "" : "s");
+        }
+        fmt_duration(v->heat_t - v->heat_from + NVME_EVERY, in, sizeof in); /* it began in the minute before */
+        if (v->heat_max_c >= 0)
+            sfmt(top, sizeof top, ", up to %.0f °C", v->heat_max_c);
+        health_event(h, EV_INFO, "disk", "%s heat slowdowns over: slowed %s%s within %s%s", v->name, how, hard, in, top);
+    }
+}
+
+static void nvme_sample(health_t *h, const procs_t *ps)
 {
     static const char *const warn[] = { "spare space below threshold", "temperature outside its limits",
                                         "reliability degraded", "drive switched to read-only",
@@ -563,7 +627,8 @@ static void nvme_sample(health_t *h)
         unsigned char b[512];
         int was = v->state;
         unsigned old_crit = v->crit;
-        unsigned long long old_media = v->media_err;
+        unsigned long long old_media = v->media_err, n0[2] = { v->heat_n[0], v->heat_n[1] },
+                           s0[2] = { v->heat_s[0], v->heat_s[1] };
         if (nvme_read_log(v->name, b, &v->state))
             continue;
         v->crit = b[0];
@@ -581,6 +646,12 @@ static void nvme_sample(health_t *h)
         v->err_log = le(b + 176, 8);
         v->warn_min = le(b + 192, 4);
         v->crit_min = le(b + 196, 4);
+        for (int t = 0; t < 2; t++) { /* thermal management: transitions, then total seconds */
+            v->heat_n[t] = le(b + 216 + 4 * t, 4);
+            v->heat_s[t] = le(b + 224 + 4 * t, 4);
+        }
+        if (was == 1)
+            nvme_heat(h, ps, v, n0, s0);
         for (int bit = 0; bit < 6; bit++)
             if ((v->crit & (1u << bit)) && (was != 1 || !(old_crit & (1u << bit))))
                 health_event(h, EV_ERR, "disk", "%s: %s", v->name, warn[bit]);
@@ -733,6 +804,20 @@ static const char *usb_port_kind(const char *text, char *port, size_t pn)
 int event_explain(const char *cat, const char *text, char *out, size_t n)
 {
     out[0] = '\0';
+    if (!strcmp(cat, "usb") && strstr(text, " at USB 2 speed, though it can do ")) {
+        str_copy(out, n, "It can do USB 3 but connected at USB 2 speed, so copies to and from it are many times slower "
+                         "(USB 2 manages about 40 MB/s). Usually a USB 2 cable, hub or extension on the way, or a plug "
+                         "not pushed in all the way. Plug it in again firmly, or try another cable or port.");
+        return 1;
+    }
+    if (!strcmp(cat, "usb") && strstr(text, " dropped off and came back")) {
+        str_copy(out, n, "The device lost its connection for a moment and connected again. If nobody touched it: a loose "
+                         "plug or cable, a worn socket, or too little power (a powered hub helps drives). A drive that "
+                         "drops off while being written to can lose what was being written.");
+        return 1;
+    }
+    if (!strcmp(cat, "usb") && strncmp(text, "usb ", 4)) /* plugged in or out: nothing to explain */
+        return 0;
     if (!strcmp(cat, "usb")) {
         char port[24], where[160] = "";
         const char *kind = usb_port_kind(text, port, sizeof port);
@@ -1260,7 +1345,7 @@ static void temp_events(health_t *h, sensors_t *S, const procs_t *ps, double now
 {
     for (int i = 0; i < S->n; i++) {
         sensor_t *t = &S->s[i];
-        if (t->type != SENS_TEMP || !t->ok || t->hidden)
+        if (t->type != SENS_TEMP || !t->ok || t->hidden || !sensor_plausible(t))
             continue;
         double lim = t->crit > 0 ? t->crit : (i == S->cpu_idx ? 100.0 : -1);
         if (lim <= 0 || t->value < lim - 2)
@@ -1326,9 +1411,20 @@ static void netq_events(health_t *h, const net_t *nt, double now)
     if (!q->on)
         return;
     int wifi = 0;
+    char air[80] = ""; /* the Wi-Fi as it is: a weak signal or a crowded band explains most lag */
     for (int i = 0; i < nt->n; i++)
-        if (!strcmp(nt->i[i].name, q->iface))
-            wifi = nt->i[i].wireless;
+        if (!strcmp(nt->i[i].name, q->iface)) {
+            const netif_t *f = &nt->i[i];
+            wifi = f->wireless;
+            if (wifi && f->wifi.ok && f->quality >= 0) {
+                char sp[24] = "";
+                if (f->wifi.tx_mbps > 0)
+                    sfmt(sp, sizeof sp, ", %.0f Mb/s", f->wifi.tx_mbps);
+                sfmt(air, sizeof air, "; Wi-Fi signal %.0f dBm, %s channel %d%s", f->signal_dbm, wifi_band(f->wifi.freq),
+                     f->wifi.channel, sp);
+            } else if (wifi && f->quality >= 0)
+                sfmt(air, sizeof air, "; Wi-Fi signal %.0f dBm", f->signal_dbm);
+        }
     char link[48];
     if (wifi)
         str_copy(link, sizeof link, "Wi-Fi");
@@ -1354,7 +1450,7 @@ static void netq_events(health_t *h, const net_t *nt, double now)
             else
                 sfmt(what, sizeof what, "%s answers in %.0f ms", k == NQ_ROUTER ? "the router" : t->addr, t->worst_ms);
             if (k == NQ_ROUTER)
-                health_event(h, EV_WARN, "net", "%s trouble: %s (%s)", link, what, t->addr);
+                health_event(h, EV_WARN, "net", "%s trouble: %s (%s)%s", link, what, t->addr, air);
             else
                 health_event(h, EV_WARN, "net", "Internet trouble: %s, while the router answers normally: it's beyond your network",
                              what);
@@ -1479,6 +1575,36 @@ void health_sample(sys_t *s)
     limit_events(h, &s->sens, now, mono);
     link_events(h, &s->net, now);
     netq_events(h, &s->net, now);
+    for (int i = 0; i < s->gpus.n; i++) { /* a screen on the GPU that could sleep: it can't any more */
+        gpu_t *g = &s->gpus.g[i];
+        char now_on[128] = "";
+        for (int k = 0; k < g->nscr; k++)
+            if (g->scr[k].on && strlen(now_on) + strlen(g->scr[k].conn) + 2 < sizeof now_on) {
+                strcat(now_on, g->scr[k].conn);
+                strcat(now_on, ",");
+            }
+        char held[64];
+        if (g->scr_primed && gpu_screen_holds(g, held, sizeof held)[0])
+            for (int k = 0; k < g->nscr; k++) {
+                char key[32];
+                sfmt(key, sizeof key, "%s,", g->scr[k].conn);
+                if (g->scr[k].on && !strstr(g->scr_told, key)) {
+                    health_event(h, EV_INFO, "gpu", "A screen on %s%s%s%s keeps the %s GPU awake: that port is wired to it",
+                                 g->scr[k].conn, g->scr[k].monitor[0] ? " (" : "", g->scr[k].monitor,
+                                 g->scr[k].monitor[0] ? ")" : "", g->vendor);
+                    break;
+                }
+            }
+        if (g->scr_t > 0) {
+            str_copy(g->scr_told, sizeof g->scr_told, now_on);
+            g->scr_primed = 1;
+        }
+    }
+    for (int i = 0; i < s->net.n; i++) { /* Wi-Fi moved to another band */
+        char moved[160];
+        if (s->net.i[i].wireless && wifi_band_moved(&s->net.i[i], mono, moved, sizeof moved))
+            health_event(h, EV_INFO, "net", "%s", moved);
+    }
     fs_events(h, &s->disks, now);
     gpu_events(h, &s->gpus, &s->procs, now, mono);
     power_limit_sample(h, s, dt, now, mono);
@@ -1504,7 +1630,7 @@ void health_sample(sys_t *s)
     if (h->nnvme && mono >= h->next_nvme) {
         h->next_nvme = mono + NVME_EVERY;
         t0 = now_sec();
-        nvme_sample(h);
+        nvme_sample(h, &s->procs);
         slow_part(h, t0, "the NVMe drives' health");
     }
     if (h->nsata && mono >= h->next_sata) {

@@ -117,7 +117,11 @@ static void hw_sensors(sys_t *s, lc_t *c)
             continue;
         }
         char lim[48] = "";
-        if (t->type == SENS_TEMP) {
+        if (!sensor_plausible(t)) { /* no chip gets there: nothing is connected to it */
+            xx += put(y, xx, 9, A_GRAY, "%5.1f%s", t->value, DEG);
+            put(y, xx + 1, c->x + c->w - xx - 1, A_GRAY, "%s", "nothing connected (no real reading)");
+            continue;
+        } else if (t->type == SENS_TEMP) {
             xx += put(y, xx, 9, temp_attr_lim(t->value, t->uhi) | A_BOLD, "%5.1f%s", t->value, DEG);
             double ref = t->uhi > 0 ? t->uhi : t->crit > 0 ? t->crit : 100.0;
             int bw = MIN(20, c->x + c->w - xx - 14);
@@ -279,6 +283,26 @@ static void hw_health(sys_t *s, lc_t *c)
         if (v->warn_min || v->crit_min)
             lc_kv(c, "", CP(C_WARN), "%llu min above its warning temperature, %llu min above critical", v->warn_min,
                   v->crit_min);
+        if (v->heat_n[0] || v->heat_n[1] || v->heat_s[0] || v->heat_s[1]) {
+            char part[2][48], when[32] = "";
+            for (int t = 0; t < 2; t++) {
+                char d[24] = "";
+                if (v->heat_s[t])
+                    fmt_duration((double)v->heat_s[t], d, sizeof d);
+                sfmt(part[t], sizeof part[t], "%llu %s%s%s%s", v->heat_n[t], t ? "hard" : "light", d[0] ? " (" : "", d,
+                     d[0] ? ")" : "");
+            }
+            if (v->heat_open) {
+                sfmt(when, sizeof when, "%s", "; slowing down now");
+            } else if (v->heat_t > 0) {
+                time_t t = (time_t)v->heat_t;
+                struct tm tm;
+                if (localtime_r(&t, &tm))
+                    strftime(when, sizeof when, "; last at %H:%M", &tm);
+            }
+            lc_kv(c, "", v->heat_open ? CP(C_WARN) | A_BOLD : v->heat_n[1] ? CP(C_WARN) : A_NORMAL,
+                  "Heat slowdowns since new: %s, %s%s", part[0], part[1], when);
+        }
     }
 
     /* SATA SSDs and hard disks */
@@ -363,13 +387,33 @@ static void hw_gpus(sys_t *s, lc_t *c)
             app(b, sizeof b, "%sPCI %s", SEP, g->pci);
         app(b, sizeof b, "%s%s%s", SEP, g->card, g->integrated ? " (integrated)" : "");
         lc_kv(c, "  Driver", A_NORMAL, "%s", b);
+        for (int k = 0; k < g->nscr; k++) { /* the screens on its ports */
+            const screen_t *sc = &g->scr[k];
+            char what[96] = "";
+            if (sc->builtin)
+                str_copy(what, sizeof what, "the built-in screen");
+            else
+                str_copy(what, sizeof what, sc->monitor[0] ? sc->monitor : "a screen");
+            if (sc->inch >= 7)
+                app(what, sizeof what, ", %.0f\"", sc->inch);
+            if (sc->w > 0)
+                app(what, sizeof what, ", %dx%d", sc->w, sc->h);
+            lc_kv(c, k ? "" : "  Screens", sc->on ? A_NORMAL : A_GRAY, "%s: %s%s", sc->conn, what,
+                  sc->on ? "" : " (connected, not in use)");
+        }
         if (g->nv_state != NV_NONE) { /* NVIDIA: asleep or awake, and what hsm does about it */
+            char held[64], why[160] = "";
+            gpu_screen_holds(g, held, sizeof held);
+            if (held[0] && g->nv_state == NV_ON)
+                sfmt(why, sizeof why, "awake: the screen on %s keeps it on", held);
             const char *ps = g->nv_state == NV_ASLEEP ? "asleep (powered off)"
                            : g->nv_state == NV_IDLE   ? "idle: hsm let go of it so it can power off"
+                           : held[0]                  ? why
                            : !g->pm_auto              ? "awake (it can't power off: runtime power management is off)"
-                           : g->nv_fails              ? "awake: something else keeps it on (a screen on it, or a program using it)"
+                           : g->nv_fails              ? "awake: something else keeps it on (a program using it?)"
                                                       : "awake (powers off by itself when idle; hsm lets it)";
-            lc_kv(c, "  Power state", g->nv_state == NV_ASLEEP ? CP(C_OK) : A_NORMAL, "%s", ps);
+            lc_kv(c, "  Power state", g->nv_state == NV_ASLEEP ? CP(C_OK) : held[0] && g->nv_state == NV_ON ? CP(C_WARN) : A_NORMAL,
+                  "%s", ps);
         }
         if (g->nv_state == NV_ASLEEP || g->nv_state == NV_IDLE) {
             if (g->note[0])
@@ -503,11 +547,6 @@ static void hw_power(sys_t *s, lc_t *c)
                 lc_kv(c, "  Charge limit", A_BOLD, "stops charging at %d%%", b->lim_end);
             else
                 lc_kv(c, "  Charge limit", A_NORMAL, "%s", "none: charges to 100%");
-            /* full and plugged in all day: a limit slows the wear */
-            if (b->lim_end < 0 && p->ac_online == 1 && b->capacity >= 95) {
-                lc_text(c, A_GRAY, "    A battery kept full on AC wears faster; this laptop can stop at 60-80%%:");
-                lc_text(c, A_GRAY, "    echo 80 | sudo tee %s/%s", b->path, b->lim_file);
-            }
         }
     }
     if (p->ac_online >= 0)
@@ -694,6 +733,36 @@ static void hw_system(sys_t *s, lc_t *c)
     fmt_rate(m->swapin_bps, a, sizeof a);
     fmt_rate(m->swapout_bps, b, sizeof b);
     lc_kv(c, "Swap I/O", A_NORMAL, "in %s, out %s, %.0f major faults/s", a, b, m->majflt_rate);
+    for (int i = 0; i < m->nswap; i++) {
+        const swapdev_t *sw = &m->swap[i];
+        char more[96] = "";
+        fmt_bytes((double)sw->used, a, sizeof a);
+        fmt_bytes((double)sw->size, b, sizeof b);
+        if (sw->zram) { /* how well it compresses, and what it costs in RAM */
+            char r[24];
+            if (sw->compr > 0 && sw->orig > 0)
+                sfmt(more, sizeof more, ", %.1fx smaller%s%s%s", (double)sw->orig / (double)sw->compr,
+                     sw->algo[0] ? " (" : "", sw->algo, sw->algo[0] ? ")" : "");
+            if (sw->ram > 0) {
+                fmt_bytes((double)sw->ram, r, sizeof r);
+                app(more, sizeof more, ", takes %s", r);
+            }
+        } else {
+            sfmt(more, sizeof more, ", priority %d", sw->prio);
+        }
+        lc_kv(c, i ? "" : "Swap devices", A_NORMAL, "%s %s: %s of %s%s", sw->name,
+              sw->zram ? "compressed RAM" : sw->file ? "file" : "partition", a, b, more);
+    }
+    if (m->zswap == 1) {
+        char st[64] = "";
+        if (m->zswap_stored && m->zswap_pool) {
+            fmt_bytes((double)m->zswap_stored, a, sizeof a);
+            fmt_bytes((double)m->zswap_pool, b, sizeof b);
+            sfmt(st, sizeof st, ": %s kept in %s of RAM", a, b);
+        }
+        lc_kv(c, "zswap", A_NORMAL, "on (a compressed cache in front of swap%s%s)%s", m->zswap_algo[0] ? ", " : "",
+              m->zswap_algo, st);
+    }
 }
 
 static void hw_storage(sys_t *s, lc_t *c)
@@ -756,9 +825,34 @@ static void hw_network(sys_t *s, lc_t *c)
         fmt_bytes((double)f->rx_total, ta, sizeof ta);
         fmt_bytes((double)f->tx_total, tb, sizeof tb);
         lc_text(c, A_GRAY, "  %s %s  %s %s   total rx %s  tx %s", U ? "↓" : "in", a, U ? "↑" : "out", b, ta, tb);
-        if (f->quality >= 0)
-            lc_text(c, f->signal_dbm >= -67 ? CP(C_OK) : f->signal_dbm >= -75 ? CP(C_WARN) : CP(C_CRIT),
-                    "  Wi-Fi signal %.0f dBm, link quality %d%%", f->signal_dbm, f->quality);
+        attr_t sa = f->signal_dbm >= -67 ? CP(C_OK) : f->signal_dbm >= -75 ? CP(C_WARN) : CP(C_CRIT);
+        if (f->wifi.ok) {
+            const wifi_t *wf = &f->wifi;
+            char gen[16] = "", wd[24] = "", sig[48] = "", tx[16] = "?", rx[16] = "?", rs[32] = "", ct[32] = "";
+            if (wf->gen)
+                sfmt(gen, sizeof gen, "Wi-Fi %d, ", wf->gen);
+            if (wf->width)
+                sfmt(wd, sizeof wd, ", %d MHz wide", wf->width);
+            if (f->quality >= 0)
+                sfmt(sig, sizeof sig, ", signal %.0f dBm (%d%%)", f->signal_dbm, f->quality);
+            lc_text(c, f->quality >= 0 ? sa : A_NORMAL, "  %s%s channel %d%s%s", gen, wifi_band(wf->freq), wf->channel,
+                    wd, sig);
+            if (wf->tx_mbps > 0)
+                sfmt(tx, sizeof tx, "%.0f", wf->tx_mbps);
+            if (wf->rx_mbps > 0)
+                sfmt(rx, sizeof rx, "%.0f", wf->rx_mbps);
+            if (wf->retry_pct >= 0)
+                sfmt(rs, sizeof rs, ", %.0f%% sent again", wf->retry_pct);
+            if (wf->connected_s) {
+                char d[24];
+                fmt_duration((double)wf->connected_s, d, sizeof d);
+                sfmt(ct, sizeof ct, ", connected %s", d);
+            }
+            lc_text(c, wf->retry_pct >= 15 || (wf->tx_mbps > 0 && wf->tx_mbps < 30) ? CP(C_WARN) : A_NORMAL,
+                    "  link %s Mb/s out, %s Mb/s in%s%s", tx, rx, rs, ct);
+        } else if (f->quality >= 0) {
+            lc_text(c, sa, "  Wi-Fi signal %.0f dBm, link quality %d%%", f->signal_dbm, f->quality);
+        }
         if (f->errors || f->drops || f->err_rate > 0 || f->drop_rate > 0)
             lc_text(c, f->err_rate + f->drop_rate > 0 ? CP(C_CRIT) | A_BOLD : A_GRAY,
                     "  %llu errors, %llu dropped packets since boot (now %.0f/s)", f->errors, f->drops,
@@ -804,6 +898,43 @@ static void hw_network(sys_t *s, lc_t *c)
     }
 }
 
+/* what's plugged in, at what speed, from which port */
+static void hw_usb(sys_t *s, lc_t *c)
+{
+    const usb_t *u = &s->usb;
+    if (!u->ok)
+        return;
+    lc_title(c, "USB");
+    if (!u->n) {
+        lc_text(c, A_GRAY, "%s", "Nothing plugged in");
+        return;
+    }
+    int iw = 4;
+    for (int i = 0; i < u->n; i++)
+        iw = MAX(iw, (int)strlen(u->d[i].id));
+    iw = MIN(iw, 10);
+    int nw = CLAMP(c->w - iw - 43, 12, 30);
+    lc_text(c, A_GRAY, "%-*s %-*s %-14s %-10s %s", iw, "Port", nw, "Device", "Kind", "Speed", "Where");
+    for (int i = 0; i < u->n; i++) {
+        const usbdev_t *d = &u->d[i];
+        char sp[24], kind[40];
+        usb_speed(d->mbps, sp, sizeof sp);
+        if (d->blk[0])
+            sfmt(kind, sizeof kind, "%s %s", d->kind, d->blk);
+        else
+            str_copy(kind, sizeof kind, d->kind);
+        const char *w = d->where == 1 ? "socket" : d->where == 2 ? "built in" : d->where == 3 ? "via hub" : "";
+        lc_text(c, d->slow ? CP(C_WARN) | A_BOLD : A_NORMAL, "%-*s %-*.*s %-14s %-10s %s", iw, d->id, nw, nw, d->name,
+                kind, sp, w);
+        if (d->slow)
+            lc_text(c, CP(C_WARN), "%*s runs at USB 2 speed, can do %dG: %s", iw, "", d->can / 1000,
+                    d->port3 == 1 ? "a USB 2 cable, or the plug not in all the way?"
+                    : d->depth && !d->port3 ? "it's behind a USB 2 hub"
+                    : !d->port3             ? "this port is USB 2 only, try another"
+                                            : "a USB 2 port, hub or cable on the way");
+    }
+}
+
 void hardware(sys_t *s, ui_state_t *u)
 {
     int top = 1, h = LINES - 2, inner = h - 2;
@@ -811,7 +942,7 @@ void hardware(sys_t *s, ui_state_t *u)
     if (COLS >= 110) {
         int lw = COLS / 2;
         box_(top, 0, h, lw, "Health · Sensors · Graphics · Power", NULL);
-        box_(top, lw, h, COLS - lw, "System · Storage · Network", NULL);
+        box_(top, lw, h, COLS - lw, "System · Storage · Network · USB", NULL);
         lc_t L = { top + 1, 2, lw - 4, inner, 0, u->hw_scroll };
         lc_t R = { top + 1, lw + 2, COLS - lw - 4, inner, 0, u->hw_scroll };
         hw_health(s, &L);
@@ -821,6 +952,7 @@ void hardware(sys_t *s, ui_state_t *u)
         hw_system(s, &R);
         hw_storage(s, &R);
         hw_network(s, &R);
+        hw_usb(s, &R);
         u->hw_max = MAX(0, MAX(L.line, R.line) - inner);
     } else {
         box_(top, 0, h, COLS, "Hardware", NULL);
@@ -832,6 +964,7 @@ void hardware(sys_t *s, ui_state_t *u)
         hw_power(s, &C);
         hw_storage(s, &C);
         hw_network(s, &C);
+        hw_usb(s, &C);
         u->hw_max = MAX(0, C.line - inner);
     }
     if (u->hw_max > 0) {

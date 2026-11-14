@@ -52,6 +52,11 @@ int ui_init(int utf8)
     DEG = U ? "°C" : "C";
     if (!newterm(NULL, stdout, stdin)) /* unlike initscr(), lets us explain a bad $TERM */
         return -1;
+    char *cup = tigetstr("cup");
+    if (!cup || cup == (char *)-1) { /* "dumb": it can't put text where it belongs */
+        endwin();
+        return -2;
+    }
     cbreak();
     noecho();
     nonl();

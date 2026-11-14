@@ -216,7 +216,7 @@ static int headless(ui_state_t *u, int sys_log, const pid_t *pids, int npid, dou
             next = now_sec() + sample;
     }
     if (watch)
-        watch_end();
+        watch_end(&S);
     netq_set(0, NULL);
     if (sfd >= 0)
         close(sfd);
@@ -407,14 +407,21 @@ int main(int argc, char **argv)
         u.interval = interval;
     watch_start(&S, &u, "screen", 1); /* how did the last session end? (and the logs' columns) */
     u.notice_open = g_notice.n > 0;
-    if (ui_init(utf8) != 0) {
+    int ui = ui_init(utf8);
+    if (ui != 0) {
         const char *t = getenv("TERM");
-        fprintf(stderr,
-                "%s: unknown terminal type '%s'.\n"
-                "Try:  TERM=xterm-256color %s\n"
-                "(or install your distribution's ncurses-term package)\n",
-                APP_NAME, t ? t : "", APP_NAME);
-        watch_end();
+        if (ui == -2)
+            fprintf(stderr,
+                    "%s: this terminal ('%s') can't move the cursor, so a screen like hsm's can't be drawn on it.\n"
+                    "Run it in a terminal window, or use '%s --once' for a text snapshot.\n",
+                    APP_NAME, t ? t : "", APP_NAME);
+        else
+            fprintf(stderr,
+                    "%s: unknown terminal type '%s'.\n"
+                    "Try:  TERM=xterm-256color %s\n"
+                    "(or install your distribution's ncurses-term package)\n",
+                    APP_NAME, t ? t : "", APP_NAME);
+        watch_end(&S);
         sys_free(&S);
         return 1;
     }
@@ -459,7 +466,7 @@ int main(int argc, char **argv)
     }
 
     ui_end();
-    watch_end();
+    watch_end(&S);
     if (g_log.f)
         printf("Log saved: %s (%lu rows)\n", pretty(g_log.path), g_log.rows);
     for (int i = 0; i < g_log.nplog; i++)

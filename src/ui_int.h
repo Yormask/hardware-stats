@@ -127,6 +127,7 @@ void events_click(ui_state_t *u, int k);
 void events_release(void); /* the view was left: free what it read */
 void cool_view(sys_t *s, ui_state_t *u); /* Hardware view > C */
 int cool_key(sys_t *s, ui_state_t *u, int ch);
+int cool_guard(sys_t *s, ui_state_t *u, int k); /* 1: a running check holds the view (asks first) */
 void drives_open(sys_t *s, ui_state_t *u); /* Hardware view > D */
 void drives_view(sys_t *s, ui_state_t *u);
 int drives_key(ui_state_t *u, int ch);
